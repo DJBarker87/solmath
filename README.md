@@ -57,7 +57,7 @@ solmath-core = "0.1"
 
 ### Feature Flags
 
-By default all modules are compiled (`full` feature). For on-chain programs that only need specific functionality, disable defaults and pick what you need:
+Default features are `transcendental + complex`. For on-chain programs that only need specific functionality, disable defaults and pick what you need:
 
 ```toml
 # AMM pool math only — smallest binary
@@ -144,7 +144,7 @@ All well under Solana's 10 MB program limit. LTO strips unused code paths even w
 
 ² exp max error of 473M occurs at the i128 overflow boundary (|x| ≈ 40). Within the financial domain (|x| < 20), max error is 1 ULP.
 
-Accuracy from 100K stratified offline vectors (mpmath 50-digit reference). CU from 100K on-chain vectors (Solana BPF).
+Accuracy from 100K stratified offline vectors (mpmath 50-digit reference). CU from 50K on-chain vectors (NUC localnet, `BENCH_CONCURRENCY=32`).
 
 <details>
 <summary>HP Black-Scholes — 100K vectors, outputs >= $0.01</summary>
@@ -241,8 +241,6 @@ Measured on NUC localnet (`BENCH_CONCURRENCY=32`), 50,000 vectors per function.
 | fp_div_hp | 1,376 | 1,345 | 1,480 | 1,486 | 1 |
 | checked_mul_div_i | 883 | 883 | 1,106 | 3,807 | 0 |
 
-Additional arithmetic instructions were exercised in the same rerun, but their log parsing needs adjustment before publishing CU figures.
-
 ## Accuracy
 
 Validated against 3M+ offline test vectors (100K stratified production per function + 443K barrier vectors from QuantLib + 10K adversarial + 1.35M original suite) plus 1M on-chain vectors on Solana localnet. References computed with mpmath at 50-digit precision, cross-checked against scipy and QuantLib.
@@ -327,7 +325,7 @@ black_scholes_price_hp(s, k, r, sigma, t) -> Result<(u128, u128), SolMathError>
 // High-precision variant — ~118K CU, 10+ sig figs on every Greek
 bs_full_hp(s, k, r, sigma, t) -> Result<BsFull, SolMathError>
 
-// Implied volatility — Li (2006) rational guess → Halley → Jäckel fallback, ~125K CU
+// Implied volatility — Li (2006) rational guess → Halley → Jäckel fallback, ~157K CU avg / 148K median
 // Returns Err(NoConvergence) for sub-ULP extrinsic (deep ITM) or zero-vega cases
 implied_vol(market_price, s, k, r, t) -> Result<u128, SolMathError>
 
@@ -358,7 +356,7 @@ bs_rho(s, k, r, sigma, t) -> Result<(i128, i128), SolMathError>    // (call_rho,
 ln_fixed_i(x: u128) -> Result<i128, SolMathError>   // 4.5K CU, 3 ULP max (table-assisted)
 exp_fixed_i(x: i128) -> Result<i128, SolMathError>   // 5K CU, 1 ULP median (see accuracy table)
 pow_fixed(base, exp) -> Result<u128, SolMathError>    // via exp(exp * ln(base))
-pow_fixed_hp(base, exp) -> Result<u128, SolMathError> // 1 ULP, ~17K CU, tested up to 100×SCALE
+pow_fixed_hp(base, exp) -> Result<u128, SolMathError> // 1 ULP median, ~27K CU, tested up to 100×SCALE
 pow_int(base: u128, n: u128) -> Result<u128, SolMathError> // integer power, split recursion
 pow_fixed_i(base: i128, exp: i128) -> Result<i128, SolMathError> // signed power
 ln_fixed_hp(x: i128) -> Result<i128, SolMathError>   // HP variant, 2 ULP max, ~19K CU (compensated DW)
@@ -505,8 +503,6 @@ python3 scripts/generate_adversarial_vectors.py
 python3 scripts/generate_barrier_vectors.py
 python3 scripts/crosscheck_quantlib.py
 ```
-
-See `benchmark/PRODUCTION_VALIDATION_REPORT.md` for complete results.
 
 ## License
 
