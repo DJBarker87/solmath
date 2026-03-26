@@ -5,7 +5,7 @@ Financial math that fits on Solana.
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
 - **9-22x faster** than `rust_decimal` for transcendentals, **10-23x faster** than `brine-fp`
-- **Price + all 5 Greeks in ~50K CU** — one Solana instruction, room to spare
+- **Black Scholes Option Price + all 5 Greeks in ~50K CU** — one Solana instruction, room to spare
 - **10-14 sig figs** vs QuantLib on the HP Black-Scholes path
 - **Proved error bounds** for core primitives ([PROOFS.md](PROOFS.md))
 - **European barrier options** — all 4 types (down/up × in/out), ~263K CU, validated against QuantLib on 443K vectors
