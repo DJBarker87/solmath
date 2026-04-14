@@ -1,4 +1,4 @@
-//! # solmath-core
+//! # solmath
 //!
 //! Fixed-point financial math for Solana. Black-Scholes, Greeks, implied volatility,
 //! fat-tail pricing, and weighted pool math — all in pure integer arithmetic.
@@ -7,23 +7,26 @@
 //! HP variants use 1e15 internally but accept and return 1e12 values.
 //!
 //! ```
-//! use solmath_core::*;
+//! # #[cfg(feature = "transcendental")]
+//! # fn price() -> Result<(), solmath::SolMathError> {
+//! use solmath::*;
 //!
-//! fn price() -> Result<(), SolMathError> {
-//!     // 1.5 in fixed-point
-//!     let x: u128 = 1_500_000_000_000;
-//!     let ln_x = ln_fixed_i(x)?; // ≈ 0.405 * 1e12
+//! // 1.5 in fixed-point
+//! let x: u128 = 1_500_000_000_000;
+//! let ln_x = ln_fixed_i(x)?; // ≈ 0.405 * 1e12
 //!
-//!     // Black-Scholes: S=100, K=100, r=5%, σ=20%, T=1yr
-//!     let s = 100 * SCALE;
-//!     let k = 100 * SCALE;
-//!     let r = 50_000_000_000u128;  // 0.05
-//!     let sigma = 200_000_000_000u128; // 0.20
-//!     let t = SCALE; // 1.0
-//!     let greeks = bs_full_hp(s, k, r, sigma, t)?;
-//!     // greeks.call, greeks.put, greeks.gamma, greeks.vega, ...
-//!     Ok(())
-//! }
+//! // Black-Scholes: S=100, K=100, r=5%, σ=20%, T=1yr
+//! let s = 100 * SCALE;
+//! let k = 100 * SCALE;
+//! let r = 50_000_000_000u128;  // 0.05
+//! let sigma = 200_000_000_000u128; // 0.20
+//! let t = SCALE; // 1.0
+//! let greeks = bs_full_hp(s, k, r, sigma, t)?;
+//! // greeks.call, greeks.put, greeks.gamma, greeks.vega, ...
+//! # let _ = ln_x;
+//! # let _ = greeks;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! Agrees with QuantLib's AnalyticEuropeanEngine to 10-14 significant figures.
@@ -37,58 +40,64 @@ extern crate std;
 
 // Core — always compiled
 mod constants;
-mod error;
-mod arithmetic;
-mod overflow;
-mod mul_div;
+pub mod error;
+pub mod arithmetic;
+pub mod overflow;
+pub mod mul_div;
 pub mod double_word;
 mod utils;
 
 // Transcendental bundle
 #[cfg(feature = "transcendental")]
-mod transcendental;
+pub mod transcendental;
 #[cfg(feature = "transcendental")]
-mod trig;
+pub mod trig;
 #[cfg(feature = "transcendental")]
-mod normal;
+pub mod normal;
 #[cfg(feature = "transcendental")]
-mod hp;
+pub mod hp;
 #[cfg(feature = "transcendental")]
-mod i64_math;
+pub mod i64_math;
 
 // Complex arithmetic
 #[cfg(feature = "complex")]
-mod complex;
+pub mod complex;
 
 // Black-Scholes
 #[cfg(feature = "bs")]
-mod bs;
+pub mod bs;
 
 // Implied volatility
 #[cfg(feature = "iv")]
-mod iv;
+pub mod iv;
 
 // Barrier options
 #[cfg(feature = "barrier")]
-mod barrier;
+pub mod barrier;
 
 // NIG fat-tail pricing
 #[cfg(feature = "nig")]
-mod nig;
+pub mod nig;
 
 // Heston stochastic volatility
 #[cfg(feature = "heston")]
-mod heston;
+pub mod heston;
 #[cfg(feature = "heston")]
 mod i64_cf;
 
 // SABR stochastic volatility
 #[cfg(feature = "sabr")]
-mod sabr;
+pub mod sabr;
 
 // Pool math
 #[cfg(feature = "pool")]
-mod pool;
+pub mod pool;
+
+// Bivariate normal CDF
+#[cfg(feature = "bivariate")]
+pub mod bvn_cdf;
+#[cfg(feature = "bivariate")]
+pub mod phi2table;
 
 // ── Public API ──
 
@@ -169,9 +178,41 @@ pub use sabr::{
 #[cfg(feature = "pool")]
 pub use pool::{weighted_pool_swap, token_to_fp, fp_to_token_floor, fp_to_token_ceil};
 
+// Bivariate normal CDF
+#[cfg(feature = "bivariate")]
+pub use bvn_cdf::{bvn_cdf, bvn_cdf_hp};
+#[cfg(feature = "bivariate")]
+pub use phi2table::Phi2Table;
+
 #[cfg(all(test, feature = "full"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_module_paths_are_available() {
+        let price = crate::bs::black_scholes_price(
+            100 * SCALE,
+            100 * SCALE,
+            50_000_000_000,
+            200_000_000_000,
+            SCALE,
+        )
+        .unwrap();
+        let same_price = black_scholes_price(
+            100 * SCALE,
+            100 * SCALE,
+            50_000_000_000,
+            200_000_000_000,
+            SCALE,
+        )
+        .unwrap();
+
+        assert_eq!(price, same_price);
+        assert_eq!(
+            crate::barrier::BarrierType::DownAndOut,
+            BarrierType::DownAndOut
+        );
+    }
 
     // ── Arithmetic errors ──
 
@@ -699,7 +740,6 @@ mod tests {
         let rate = 50_000_000_000u128;
 
         let mut pass = 0u32;
-        let mut fail = 0u32;
         let mut total = 0u32;
 
         for &s in &spots {
@@ -719,9 +759,9 @@ mod tests {
                                 } else {
                                     sigma_in - sigma_out
                                 };
-                                if err <= 1000 { pass += 1; } else { fail += 1; }
+                                if err <= 1000 { pass += 1; }
                             }
-                            Err(_) => { fail += 1; }
+                            Err(_) => {}
                         }
                     }
                 }
@@ -738,7 +778,7 @@ mod tests {
 
         // Load iv_vectors.json and report recovery by difficulty
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../benchmark/iv_vectors.json");
+            .join("benchmark/iv_vectors.json");
         let data = std::fs::read_to_string(&path)
             .unwrap_or_else(|_| panic!("Cannot read {:?}", path));
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
@@ -1546,24 +1586,20 @@ mod mul_div_cross_validation {
 
     #[test]
     fn validate_against_python() {
-        let data = include_str!("../../../tests/reference/mul_div_vectors.json");
+        let data = include_str!("../tests/reference/mul_div_vectors.json");
         let vectors: alloc::vec::Vec<Vector> = serde_json::from_str(data).expect("parse vectors");
         let total = vectors.len();
-        let mut mismatches = 0u64;
-
         for v in &vectors {
             let f = mul_div_floor(v.a, v.b, v.c).unwrap();
             let ce = mul_div_ceil(v.a, v.b, v.c).unwrap();
             if f != v.floor {
-                mismatches += 1;
                 panic!("FLOOR mismatch: a={} b={} c={} expected={} got={}", v.a, v.b, v.c, v.floor, f);
             }
             if ce != v.ceil {
-                mismatches += 1;
                 panic!("CEIL mismatch: a={} b={} c={} expected={} got={}", v.a, v.b, v.c, v.ceil, ce);
             }
         }
 
-        assert_eq!(mismatches, 0, "{} vectors validated, {} mismatches", total, mismatches);
+        assert_eq!(total, vectors.len(), "{} vectors validated", total);
     }
 }

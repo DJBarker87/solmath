@@ -19,6 +19,7 @@ fn mul_fast(a: i128, b: i128) -> i128 {
 // ============================================================
 
 /// Generic Newton-Raphson root finder. Internal — used by early IV prototypes.
+#[allow(dead_code)]
 pub(crate) fn newton_raphson(
     f: fn(i128) -> i128,
     f_prime: fn(i128) -> i128,
@@ -45,6 +46,7 @@ pub(crate) fn newton_raphson(
 
 /// Li rational polynomial initial guess for σ√T. Internal — called by implied_vol.
 #[inline(never)]
+#[allow(dead_code)]
 pub(crate) fn li_rational_guess(x: i128, c: i128) -> Result<i128, SolMathError> {
     let sc = fp_sqrt(c as u128)? as i128; // √c
     let sc3 = mul_fast(sc, c); // (√c)³ = √c · c
@@ -227,6 +229,7 @@ fn halley_step_bracketed(
 /// V1 implied volatility: Li rational guess + bracketed Halley iteration.
 /// Retained as fallback. See `implied_vol` for the production entry point.
 #[inline(never)]
+#[allow(dead_code)]
 pub(crate) fn implied_vol_v1(market_price: u128, s: u128, k: u128, r: u128, t: u128) -> Result<u128, SolMathError> {
     if s == 0 || k == 0 || t == 0 || market_price == 0 {
         return Err(SolMathError::DomainError);
@@ -395,6 +398,7 @@ pub(crate) fn implied_vol_v1(market_price: u128, s: u128, k: u128, r: u128, t: u
 /// Returns `Err(NoConvergence)` if the solver doesn't converge — never returns
 /// a bad guess.
 #[inline(never)]
+#[allow(dead_code)]
 pub(crate) fn implied_vol_iterative(
     market_price: u128,
     s: u128,
@@ -1200,13 +1204,15 @@ fn iterative_initial_guess(
 ///
 /// Uses a Li rational initial guess with bracketed Halley iteration,
 /// falling back to a Jaeckel normalised-space solver for edge cases.
-/// Architecture is designed for <=200K CU worst case on Solana.
+/// Architecture targets roughly 200K median CU on Solana, but tail cases can
+/// require a higher compute budget.
 ///
 /// # Errors
 ///
 /// - [`SolMathError::DomainError`] if `s == 0`, `k == 0`, `t == 0`, or `market_price == 0`.
-/// - [`SolMathError::NoConvergence`] for sub-ULP prices or deep OTM edge cases
-///   where no stable root can be found.
+/// - [`SolMathError::NoConvergence`] for sub-ULP prices, premiums below 100
+///   integer units (1e-10 at `SCALE`), or deep OTM edge cases where no stable
+///   root can be found.
 ///
 /// # Accuracy
 ///
@@ -1215,7 +1221,7 @@ fn iterative_initial_guess(
 /// # Example
 ///
 /// ```
-/// use solmath_core::{implied_vol, black_scholes_price, SCALE};
+/// use solmath::{implied_vol, black_scholes_price, SCALE};
 ///
 /// let s = 100 * SCALE;
 /// let k = 100 * SCALE;
@@ -1226,7 +1232,7 @@ fn iterative_initial_guess(
 /// let recovered = implied_vol(call, s, k, r, t)?;
 /// let diff = (recovered as i128 - sigma as i128).abs();
 /// assert!(diff < 1_000_000); // within ~0.0001% of input sigma
-/// # Ok::<(), solmath_core::SolMathError>(())
+/// # Ok::<(), solmath::SolMathError>(())
 /// ```
 #[inline(never)]
 pub fn implied_vol(market_price: u128, s: u128, k: u128, r: u128, t: u128) -> Result<u128, SolMathError> {
@@ -1460,6 +1466,7 @@ pub fn implied_vol(market_price: u128, s: u128, k: u128, r: u128, t: u128) -> Re
 /// Standalone Jäckel path (for benchmarking): normalise → solve → verify.
 /// Uses 2 Householder iterations. Not CU-constrained.
 #[inline(never)]
+#[allow(dead_code)]
 pub(crate) fn implied_vol_jaeckel(market_price: u128, s: u128, k: u128, r: u128, t: u128) -> Result<u128, SolMathError> {
     let s_i = s as i128;
     let k_i = k as i128;

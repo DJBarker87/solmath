@@ -125,7 +125,7 @@ Used internally by:
 ## Module structure
 
 ```
-solmath-core/src/
+solmath/src/
 ├── constants.rs      SCALE, SCALE_HP, U256, polynomial coefficients, BsFull
 ├── error.rs          SolMathError enum
 ├── arithmetic.rs     fp_mul, fp_div, fp_sqrt (core fixed-point ops)

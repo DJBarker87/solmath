@@ -573,8 +573,10 @@ pub(crate) fn poly_map_t_hp(ax: i128, mid: i128, hw: i128) -> Result<i128, SolMa
 /// Shared HP intermediates for Black-Scholes pricing.
 pub(crate) struct BsIntermediatesHp {
     pub s_hp: i128,
+    #[allow(dead_code)]
     pub k_hp: i128,
     pub d1_hp: i128,
+    #[allow(dead_code)]
     pub d2_hp: i128,
     pub phi_d1_hp: i128,
     pub phi_d2_hp: i128,
@@ -702,12 +704,12 @@ pub fn black_scholes_price_hp(
 ///
 /// # Example
 /// ```
-/// use solmath_core::{bs_full_hp, SCALE};
+/// use solmath::{bs_full_hp, SCALE};
 /// // S=100, K=100, r=5%, sigma=20%, T=1yr
 /// let greeks = bs_full_hp(100 * SCALE, 100 * SCALE, 50_000_000_000, 200_000_000_000, SCALE)?;
 /// assert!(greeks.call > 0);
 /// assert!(greeks.put > 0);
-/// # Ok::<(), solmath_core::SolMathError>(())
+/// # Ok::<(), solmath::SolMathError>(())
 /// ```
 pub fn bs_full_hp(s: u128, k: u128, r: u128, sigma: u128, t: u128) -> Result<BsFull, SolMathError> {
     if s > i128::MAX as u128 || k > i128::MAX as u128 || r > i128::MAX as u128
@@ -823,6 +825,7 @@ pub(crate) fn fp_mul_hp_fast_dw(a: i128, b: i128) -> DoubleWord {
 }
 
 /// Compensated Horner evaluation at HP scale (1e15).
+#[allow(dead_code)]
 pub(crate) fn horner_compensated_hp(coeffs: &[i128], t: i128) -> Result<i128, SolMathError> {
     Ok(horner_compensated_hp_dw(coeffs, t)?.to_i128_at_scale(SCALE_HP))
 }

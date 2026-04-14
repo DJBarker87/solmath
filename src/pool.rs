@@ -117,7 +117,7 @@ pub fn fp_to_token_ceil(fp_amount: u128, token_decimals: u8) -> Result<u64, SolM
 ///
 /// # Example
 /// ```
-/// use solmath_core::{weighted_pool_swap, SCALE};
+/// use solmath::{weighted_pool_swap, SCALE};
 /// // Equal-weight pool: 1000 tokens each, swap 10 in, 0.3% fee
 /// let (net_out, fee) = weighted_pool_swap(
 ///     1000 * SCALE, 1000 * SCALE,
@@ -126,7 +126,7 @@ pub fn fp_to_token_ceil(fp_amount: u128, token_decimals: u8) -> Result<u64, SolM
 ///     3_000_000_000, // 0.3%
 /// )?;
 /// assert!(net_out > 0);
-/// # Ok::<(), solmath_core::SolMathError>(())
+/// # Ok::<(), solmath::SolMathError>(())
 /// ```
 pub fn weighted_pool_swap(
     balance_in: u128,

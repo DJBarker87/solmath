@@ -1,6 +1,6 @@
 # SolMath — Security Properties
 
-This document covers the safety guarantees of `solmath-core`: panic behaviour,
+This document covers the safety guarantees of `solmath`: panic behaviour,
 overflow handling, domain checking, and the distinction between public API
 contracts and internal fast paths.
 
@@ -27,13 +27,13 @@ builds (including all Solana `.so` deployments).
 ## No unsafe code
 
 The library is entirely safe Rust. There is no `unsafe` block anywhere in
-`solmath-core`. This is enforced by `#![forbid(unsafe_code)]` in `lib.rs`.
+`solmath`. This is enforced by `#![forbid(unsafe_code)]` in `lib.rs`.
 
 ---
 
 ## No heap allocation
 
-`solmath-core` is `#![no_std]` with zero dependencies. It never allocates.
+`solmath` is `#![no_std]` with zero dependencies. It never allocates.
 Every value lives on the stack or in a register. This is a hard requirement
 for Solana on-chain programs.
 

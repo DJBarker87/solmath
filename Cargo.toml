@@ -1,6 +1,6 @@
 [package]
-name = "solmath-core"
-version = "0.1.1"
+name = "solmath"
+version = "0.1.2"
 edition = "2021"
 description = "Fixed-point financial math for Solana. Black-Scholes, Greeks, IV, NIG pricing, pool math — pure integer arithmetic, no_std, zero dependencies."
 license = "MIT OR Apache-2.0"
@@ -8,11 +8,20 @@ repository = "https://github.com/DJBarker87/solmath"
 keywords = ["solana", "fixed-point", "black-scholes", "defi", "math"]
 categories = ["mathematics", "no-std::no-alloc"]
 readme = "README.md"
+include = [
+    "Cargo.toml",
+    "README.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "src/**",
+]
 
 [features]
 default = ["transcendental", "complex"]
-full = ["transcendental", "complex", "bs", "iv", "barrier", "nig", "heston", "sabr", "pool"]
+full = ["transcendental", "complex", "bs", "iv", "barrier", "nig", "heston", "sabr", "pool", "bivariate"]
 transcendental = []
+bivariate = ["transcendental"]
+table-gen = ["bivariate"]
 complex = ["transcendental"]
 bs = ["transcendental"]
 iv = ["bs"]

@@ -1,7 +1,7 @@
 # SolMath — Usage Guide
 
 Worked examples for every major feature. All code compiles standalone with
-`solmath-core = { version = "0.1", features = ["full"] }`.
+`solmath = { version = "0.1", features = ["full"] }`.
 
 See [docs/API_REFERENCE.md](docs/API_REFERENCE.md) for the complete function
 listing with signatures, CU costs, and ULP accuracy.
@@ -14,7 +14,7 @@ Every value is a `u128` or `i128` integer scaled by `SCALE = 1_000_000_000_000`
 (1e12). To encode a real number, multiply by SCALE:
 
 ```rust
-use solmath_core::SCALE;
+use solmath::SCALE;
 
 let one       = SCALE;                // 1.0
 let half      = SCALE / 2;           // 0.5
@@ -36,7 +36,7 @@ let real = value as f64 / 1e12;       // 1.5
 ## Core arithmetic
 
 ```rust
-use solmath_core::*;
+use solmath::*;
 
 // Multiply: 2.5 * 3.0 = 7.5
 let a = 2 * SCALE + SCALE / 2; // 2.5
@@ -63,7 +63,7 @@ let root = fp_sqrt(2 * SCALE)?;
 When the intermediate `a * b` might exceed u128, use the mul_div family:
 
 ```rust
-use solmath_core::*;
+use solmath::*;
 
 // u64 floor(a * b / c)
 let out = mul_div_floor(1_000_000, 999_999, 1_000_000)?;
@@ -79,7 +79,7 @@ let big = mul_div_ceil_u128(u128::MAX / 2, 2, 3)?;
 ## Transcendentals
 
 ```rust
-use solmath_core::*;
+use solmath::*;
 
 // ln(2.0) ≈ 0.693147...
 let ln2 = ln_fixed_i(2 * SCALE)?;
@@ -106,7 +106,7 @@ let compound = pow_int(SCALE + 50_000_000_000, 10)?;
 ## Trigonometry
 
 ```rust
-use solmath_core::*;
+use solmath::*;
 
 // sin(π/6) ≈ 0.5
 let pi_over_6 = 523_598_775_598i128; // π/6 at SCALE
@@ -129,7 +129,7 @@ Any `i128` angle is accepted — reduction via `rem_euclid` handles the full ran
 ## Normal distribution
 
 ```rust
-use solmath_core::*;
+use solmath::*;
 
 // PDF: φ(0) ≈ 0.39894...
 let pdf = norm_pdf(0)?;
@@ -155,7 +155,7 @@ let (cdf_val, pdf_val) = norm_cdf_and_pdf(SCALE_I)?; // at x = 1.0
 The HP path gives 10-14 significant figures in ~50K CU (prices + all 5 Greeks):
 
 ```rust
-use solmath_core::*;
+use solmath::*;
 
 let s     = 100 * SCALE;           // spot = $100
 let k     = 105 * SCALE;           // strike = $105
@@ -191,7 +191,7 @@ single instruction.
 ## Implied volatility
 
 ```rust
-use solmath_core::*;
+use solmath::*;
 
 let s = 100 * SCALE;
 let k = 105 * SCALE;
@@ -216,7 +216,7 @@ rational. Typical cost: 30-60K CU.
 ## Barrier options
 
 ```rust
-use solmath_core::*;
+use solmath::*;
 
 let s     = 100 * SCALE;           // spot
 let k     = 100 * SCALE;           // strike
@@ -247,7 +247,7 @@ assert_eq!(result.price + result_in.price, result.vanilla);
 ## Weighted pool swap (AMM)
 
 ```rust
-use solmath_core::*;
+use solmath::*;
 
 // Two-token equal-weight pool: 10,000 of each token
 let bal_in  = 10_000 * SCALE;
@@ -268,7 +268,7 @@ let (net_out, fee_amt) = weighted_pool_swap(
 ### Token conversion helpers
 
 ```rust
-use solmath_core::*;
+use solmath::*;
 
 // USDC (6 decimals): 1,000,000 lamports = 1.0 USDC
 let fp = token_to_fp(1_000_000, 6)?;
@@ -287,7 +287,7 @@ assert_eq!(raw_ceil, 1_000_000);
 ## SABR stochastic volatility
 
 ```rust
-use solmath_core::*;
+use solmath::*;
 
 let f     = 100 * SCALE;            // forward
 let k     = 105 * SCALE;            // strike
@@ -319,7 +319,7 @@ for &strike in &[95 * SCALE, 100 * SCALE, 105 * SCALE, 110 * SCALE] {
 ## Heston stochastic volatility
 
 ```rust
-use solmath_core::*;
+use solmath::*;
 
 let s     = 100 * SCALE;
 let k     = 100 * SCALE;
@@ -344,7 +344,7 @@ let (call, put) = heston_price(s, k, r, t, v0, kappa, theta, xi, rho)?;
 Used internally by Heston and NIG, but available for general use:
 
 ```rust
-use solmath_core::*;
+use solmath::*;
 
 let a = Complex::new(SCALE_I, SCALE_I / 2);     // 1.0 + 0.5i
 let b = Complex::new(2 * SCALE_I, -SCALE_I);    // 2.0 - 1.0i
@@ -364,7 +364,7 @@ All fallible functions return `Result<_, SolMathError>`. Use `?` in Solana
 programs to propagate errors as instruction failures:
 
 ```rust
-use solmath_core::*;
+use solmath::*;
 
 fn my_instruction(spot: u128, strike: u128) -> Result<u128, SolMathError> {
     // Domain error if either is zero
@@ -388,19 +388,19 @@ Pick features to control binary size. Each feature pulls in its dependencies:
 
 ```toml
 # Minimal: core arithmetic only (mul, div, sqrt) — +15 KB
-solmath-core = { version = "0.1", default-features = false }
+solmath = { version = "0.1", default-features = false }
 
 # AMM pool math (needs transcendental for pow)
-solmath-core = { version = "0.1", default-features = false, features = ["pool"] }
+solmath = { version = "0.1", default-features = false, features = ["pool"] }
 
 # Options pricing + Greeks
-solmath-core = { version = "0.1", default-features = false, features = ["bs"] }
+solmath = { version = "0.1", default-features = false, features = ["bs"] }
 
 # Options + implied vol solver
-solmath-core = { version = "0.1", default-features = false, features = ["iv"] }
+solmath = { version = "0.1", default-features = false, features = ["iv"] }
 
 # Everything
-solmath-core = { version = "0.1", features = ["full"] }
+solmath = { version = "0.1", features = ["full"] }
 ```
 
 Feature dependency graph:

@@ -1,13 +1,13 @@
-/// CU logging stub (no-op outside Solana). Internal.
-#[cfg(target_os = "solana")]
+/// CU logging stub. Internal.
+#[allow(dead_code)]
 #[inline(always)]
 pub(crate) fn log_cu() {
-    // no-op outside Solana runtime
+    // Intentionally a no-op in this crate.
 }
 
-/// Fixed-point value logger (no-op outside Solana). Internal.
-#[cfg(target_os = "solana")]
+/// Fixed-point value logger. Internal.
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn msg_fp(_label: &str, _x: i128) {
-    // no-op outside Solana runtime
+    // Intentionally a no-op in this crate.
 }

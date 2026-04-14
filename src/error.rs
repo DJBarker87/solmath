@@ -1,4 +1,4 @@
-/// Errors returned by fallible solmath-core operations.
+/// Errors returned by fallible solmath operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SolMathError {
     /// Input outside the mathematical domain (e.g. ln of zero or negative)

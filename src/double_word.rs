@@ -49,6 +49,7 @@ impl DoubleWord {
 
     /// Exact addition of two DoubleWord values.
     /// Carries overflow from lo into hi. Returns Err on hi overflow.
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn add(self, other: Self) -> Result<Self, crate::error::SolMathError> {
         let lo_sum = self.lo + other.lo;
@@ -68,11 +69,13 @@ impl DoubleWord {
         })
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub(crate) const fn hi(self) -> i128 {
         self.hi
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub(crate) const fn lo(self) -> i128 {
         self.lo

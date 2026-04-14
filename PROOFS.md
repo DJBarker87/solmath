@@ -5,7 +5,7 @@ SCALE = 10^12 (or SCALE_HP = 10^15 where noted): an error of 1 means the compute
 integer result differs from the ideal real-valued result by at most 1 in the
 least-significant fixed-point unit.
 
-All line references are to `crate/solmath-core/src/`.
+All line references are to `crate/solmath/src/`.
 
 **Disclaimer:** The methodology and assumptions in this document are sound to the
 author's knowledge, but the proofs themselves were generated with AI assistance and

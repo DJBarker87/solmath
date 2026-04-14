@@ -182,7 +182,7 @@ fn all_blocks(im: &HaugIntermediates) -> Result<(i128, i128, i128, i128), SolMat
 ///
 /// # Example
 /// ```
-/// use solmath_core::{barrier_option, BarrierType, SCALE};
+/// use solmath::{barrier_option, BarrierType, SCALE};
 /// let result = barrier_option(
 ///     100 * SCALE, 100 * SCALE, 90 * SCALE,
 ///     50_000_000_000, 250_000_000_000, SCALE,
@@ -190,7 +190,7 @@ fn all_blocks(im: &HaugIntermediates) -> Result<(i128, i128, i128, i128), SolMat
 /// )?;
 /// assert!(result.price > 0);
 /// assert!(result.price <= result.vanilla);
-/// # Ok::<(), solmath_core::SolMathError>(())
+/// # Ok::<(), solmath::SolMathError>(())
 /// ```
 pub fn barrier_option(
     s: u128, k: u128, h: u128,

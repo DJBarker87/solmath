@@ -16,11 +16,11 @@ use crate::hp::pow_fixed_hp;
 ///
 /// # Example
 /// ```
-/// use solmath_core::{ln_fixed_i, SCALE};
+/// use solmath::{ln_fixed_i, SCALE};
 /// // ln(2.0) ≈ 0.693147...
 /// let result = ln_fixed_i(2 * SCALE)?;
 /// assert!((result - 693_147_180_560i128).abs() <= 3);
-/// # Ok::<(), solmath_core::SolMathError>(())
+/// # Ok::<(), solmath::SolMathError>(())
 /// ```
 pub fn ln_fixed_i(x: u128) -> Result<i128, SolMathError> {
     if x == 0 {
@@ -127,11 +127,11 @@ pub fn ln_fixed_i(x: u128) -> Result<i128, SolMathError> {
 ///
 /// # Example
 /// ```
-/// use solmath_core::{exp_fixed_i, SCALE, SCALE_I};
+/// use solmath::{exp_fixed_i, SCALE, SCALE_I};
 /// // e^1 ≈ 2.718281828...
 /// let result = exp_fixed_i(SCALE_I)?;
 /// assert!((result - 2_718_281_828_459i128).abs() <= 1);
-/// # Ok::<(), solmath_core::SolMathError>(())
+/// # Ok::<(), solmath::SolMathError>(())
 /// ```
 pub fn exp_fixed_i(x: i128) -> Result<i128, SolMathError> {
     let max_x = 40 * SCALE_I;
@@ -203,11 +203,11 @@ pub fn exp_fixed_i(x: i128) -> Result<i128, SolMathError> {
 ///
 /// # Example
 /// ```
-/// use solmath_core::{pow_fixed, SCALE};
+/// use solmath::{pow_fixed, SCALE};
 /// // 2.0 ^ 1.5 = 2*sqrt(2) ≈ 2.828427...
 /// let result = pow_fixed(2 * SCALE, 1_500_000_000_000)?;
 /// assert!((result as i128 - 2_828_427_124_746i128).abs() <= 5);
-/// # Ok::<(), solmath_core::SolMathError>(())
+/// # Ok::<(), solmath::SolMathError>(())
 /// ```
 pub fn pow_fixed(base: u128, exponent: u128) -> Result<u128, SolMathError> {
     // Special cases

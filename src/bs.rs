@@ -27,14 +27,14 @@ use crate::normal::{norm_cdf_poly, norm_cdf_and_pdf_bs_guarded};
 ///
 /// # Example
 /// ```
-/// use solmath_core::{black_scholes_price, SCALE};
+/// use solmath::{black_scholes_price, SCALE};
 /// let (call, put) = black_scholes_price(
 ///     100 * SCALE, 100 * SCALE,
 ///     50_000_000_000, 200_000_000_000, SCALE,
 /// )?;
 /// assert!(call > 0);
 /// assert!(put > 0);
-/// # Ok::<(), solmath_core::SolMathError>(())
+/// # Ok::<(), solmath::SolMathError>(())
 /// ```
 pub fn black_scholes_price(s: u128, k: u128, r: u128, sigma: u128, t: u128) -> Result<(u128, u128), SolMathError> {
     black_scholes_price_selective(s, k, r, sigma, t)
@@ -392,7 +392,7 @@ pub(crate) fn bs_rho_selective(s: u128, k: u128, r: u128, sigma: u128, t: u128) 
 ///
 /// # Example
 /// ```
-/// use solmath_core::{bs_full, SCALE};
+/// use solmath::{bs_full, SCALE};
 /// let bs = bs_full(100 * SCALE, 100 * SCALE, 50_000_000_000, 200_000_000_000, SCALE)?;
 /// assert!(bs.call > 0);
 /// assert!(bs.put > 0);
@@ -400,7 +400,7 @@ pub(crate) fn bs_rho_selective(s: u128, k: u128, r: u128, sigma: u128, t: u128) 
 /// assert!(bs.put_delta < 0);
 /// assert!(bs.gamma > 0);
 /// assert!(bs.vega > 0);
-/// # Ok::<(), solmath_core::SolMathError>(())
+/// # Ok::<(), solmath::SolMathError>(())
 /// ```
 pub fn bs_full(s: u128, k: u128, r: u128, sigma: u128, t: u128) -> Result<BsFull, SolMathError> {
     bs_full_selective(s, k, r, sigma, t)

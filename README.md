@@ -9,7 +9,7 @@ Financial math that fits on Solana.
 - **10-14 sig figs** vs QuantLib on the HP Black-Scholes path
 - **Proved error bounds** for core primitives ([PROOFS.md](PROOFS.md))
 - **European barrier options** — all 4 types (down/up × in/out), ~263K CU, validated against QuantLib on 443K vectors
-- **Reproducible validation** — 2.5M+ vectors checked against mpmath, scipy, and QuantLib
+- **Reproducible validation** — 2.5M+ vectors checked against mpmath, scipy, and QuantLib, with bundled fixture files for the crate test suite
 
 `no_std` | zero dependencies | pure integer arithmetic
 
@@ -33,7 +33,7 @@ Measured on-chain (50,000 production vectors, Solana localnet):
 ## Usage
 
 ```rust
-use solmath_core::*;
+use solmath::*;
 
 // All values are i128/u128 scaled by SCALE (1e12).
 // 1.5 → 1_500_000_000_000.  0.05 → 50_000_000_000.
@@ -52,7 +52,7 @@ let greeks = bs_full_hp(s, k, r, sigma, t);
 
 ```toml
 [dependencies]
-solmath-core = "0.1"
+solmath = "0.1"
 ```
 
 ### Feature Flags
@@ -61,13 +61,13 @@ Default features are `transcendental + complex`. For on-chain programs that only
 
 ```toml
 # AMM pool math only — smallest binary
-solmath-core = { version = "0.1", default-features = false, features = ["pool"] }
+solmath = { version = "0.1", default-features = false, features = ["pool"] }
 
 # Black-Scholes pricing + IV
-solmath-core = { version = "0.1", default-features = false, features = ["iv"] }
+solmath = { version = "0.1", default-features = false, features = ["iv"] }
 
 # Heston stochastic vol
-solmath-core = { version = "0.1", default-features = false, features = ["heston"] }
+solmath = { version = "0.1", default-features = false, features = ["heston"] }
 ```
 
 | Feature | Modules | Dependencies |
@@ -82,6 +82,8 @@ solmath-core = { version = "0.1", default-features = false, features = ["heston"
 | `heston` | Heston stochastic vol | bs, complex |
 | `sabr` | SABR stochastic vol | transcendental |
 | `pool` | weighted pool swap math | transcendental |
+| `bivariate` | bivariate normal CDF (GL6 + table lookup) | transcendental |
+| `table-gen` | offline Φ₂ table generation | bivariate |
 | `full` | everything above | all |
 | `pade-iv` | experimental Padé IV guess | iv |
 
@@ -134,15 +136,19 @@ All well under Solana's 10 MB program limit. LTO strips unused code paths even w
 | pow_fixed_hp | 0 | — | 27K | 35K |
 | pow_product_hp | 1 | — | 16K | 20K |
 | nig_64 | 2,520 | $0.06 | 344K | 386K ¹ |
+| **bvn_cdf** | **2** ⁵ | **—** | **129K** | **153K** |
+| Phi2Table.eval | 2 ⁵ | — | 943 | 943 |
 | ln_fixed_i | 1 | — | 4.5K | 5.2K |
 | ln_fixed_hp | 0 | — | 19K | 20K |
 | exp_fixed_i | 1 ² | — | 5K | 5K |
 | norm_cdf_poly | 0 | — | 6K | 15K |
 | fp_sqrt | 0 | — | 3K | 9K |
 
-¹ Requires `ComputeBudgetProgram.setComputeUnitLimit()`. Request 400K for `barrier_option`, `implied_vol`, and `nig_64`. All other functions fit within the default 200K CU budget.
+¹ Requires `ComputeBudgetProgram.setComputeUnitLimit()`. Request 500K for `barrier_option`, `implied_vol`, and `nig_64`. All other functions fit within the default 200K CU budget.
 
 ² exp max error of 473M occurs at the i128 overflow boundary (|x| ≈ 40). Within the financial domain (|x| < 20), max error is 1 ULP.
+
+⁵ bvn_cdf and Phi2Table.eval: median error 2 ULP. Max error 92K ULP at |ρ| > 0.95 (= 9.2×10⁻⁵ absolute probability). For |ρ| ≤ 0.90, max error < 1 ULP. Validated on 590K vectors (mpmath 50-digit reference) + 20K on-chain CU measurements.
 
 Accuracy from 100K stratified offline vectors (mpmath 50-digit reference). CU from 50K on-chain vectors (NUC localnet, `BENCH_CONCURRENCY=32`).
 
@@ -224,6 +230,8 @@ Measured on Solana BPF with runtime inputs (no constant folding). Median CU from
 | barrier_option | 262,906 | 261,773 | 320,907 | 320,907 | 385,456 |
 | implied_vol | 156,563 | 148,575 | — | 339,535 | 395,940 |
 | nig_64 | 344,273 | 346,648 | — | 382,667 | 386,010 |
+| **bvn_cdf** | **128,614** | **129,700** | **147,771** | — | **153,090** |
+| Phi2Table.eval | 943 | 943 | 943 | 943 | 943 |
 
 A full Black-Scholes price + all 5 Greeks fits in **50K CU average**. The HP variant with every Greek at 10+ sig figs fits in **118K CU average**. Both leave room for protocol logic within the default 200K budget. European barrier options (all 4 types) average **263K CU** with a 400K compute budget.
 
@@ -240,6 +248,59 @@ Measured on NUC localnet (`BENCH_CONCURRENCY=32`), 50,000 vectors per function.
 | fp_mul_hp_i | 103 | 103 | 103 | 103 | 0 |
 | fp_div_hp | 1,376 | 1,345 | 1,480 | 1,486 | 1 |
 | checked_mul_div_i | 883 | 883 | 1,106 | 3,807 | 0 |
+
+## Bivariate Normal CDF
+
+First fixed-point bivariate normal CDF on any blockchain. Two tiers: general (any ρ) and fast (fixed ρ with precomputed table). Feature-gated behind `bivariate`.
+
+```toml
+solmath = { version = "0.1", features = ["bivariate"] }
+```
+
+### `bvn_cdf` — general, any ρ
+
+```rust
+use solmath::{bvn_cdf, SCALE};
+
+// Φ₂(-0.5, 0.3; 0.85) — all i128 at SCALE, like everything else in SolMath
+let a   = -500_000_000_000i128;
+let b   =  300_000_000_000i128;
+let rho =  850_000_000_000i128;
+let prob = bvn_cdf(a, b, rho)?; // ≈ 0.271 × SCALE
+```
+
+6-point Gauss-Legendre quadrature (Drezner-Wesolowsky). Validated against mpmath 50-digit reference on 590K production + adversarial vectors. 20K on-chain CU measurements.
+
+| Metric | Value |
+|--------|-------|
+| CU median | 129K |
+| CU max | 153K |
+| Accuracy (|ρ| ≤ 0.90) | max error < 4×10⁻⁷ |
+| Accuracy (|ρ| ≤ 0.95) | max error < 5×10⁻⁶ |
+| Accuracy (|ρ| ≤ 0.99) | max error < 10⁻⁴ |
+| Properties | monotone, symmetric (exact), non-negative, bounded |
+
+### `Phi2Table` — fast, fixed ρ
+
+```rust
+use solmath::Phi2Table;
+
+// Embed a precomputed table as const (generated offline with `table-gen` feature)
+const MY_TABLE: Phi2Table = Phi2Table::from_array(/* 64×64 i32 array */);
+
+let prob = MY_TABLE.eval(-500_000_000_000i128, 300_000_000_000i128)?;
+```
+
+Catmull-Rom bicubic interpolation on a 64×64 lookup table. Pure i64 arithmetic — no `norm_cdf`, no i128 in the hot path.
+
+| Metric | Value |
+|--------|-------|
+| CU | 943 (constant) |
+| Accuracy | max error < 9.0×10⁻⁵ |
+| Storage | 64 KB const per table |
+| Properties | non-negative, bounded, monotone to 10⁻⁴ |
+
+Enable `table-gen` for the offline `Phi2Table::generate(rho, 64)` constructor. Not needed for on-chain evaluation.
 
 ## Accuracy
 
@@ -282,6 +343,8 @@ Validated against 3M+ offline test vectors (100K stratified production per funct
 | barrier (up put) | 552 | 13 | 7 | 1 | — | $0.000000000552 |
 | nig_64 | 64K | 49K | 16K | 2,520 | — | $0.06 |
 | implied_vol | 17M ⁴ | 20.5K | 47 | 4 | — | — |
+| bvn_cdf | 92K ⁵ | 9.6K | 864 | 2 | — | — |
+| Phi2Table.eval | 90K ⁵ | — | — | 2 | — | — |
 
 ² Dollar errors assume a ~$10 option. 1 ULP = $0.000000000001.
 

@@ -47,7 +47,7 @@ pub(crate) fn reduce_mod_2pi(x: i128) -> i128 {
 ///
 /// # Example
 /// ```
-/// use solmath_core::{sin_fixed, SCALE_I};
+/// use solmath::{sin_fixed, SCALE_I};
 /// // sin(π/2) ≈ 1.0
 /// let pi_over_2 = 1_570_796_326_795i128; // π/2 at SCALE
 /// let result = sin_fixed(pi_over_2).unwrap();

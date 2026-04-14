@@ -10,7 +10,7 @@ use crate::overflow::checked_mul_div_rem_u;
 ///
 /// # Examples
 /// ```
-/// use solmath_core::mul_div_floor;
+/// use solmath::mul_div_floor;
 /// assert_eq!(mul_div_floor(100, 200, 300).unwrap(), 66);
 /// assert_eq!(mul_div_floor(u64::MAX, 2, 3).unwrap(), 12297829382473034410);
 /// ```
@@ -37,7 +37,7 @@ pub fn mul_div_floor(a: u64, b: u64, c: u64) -> Result<u64, SolMathError> {
 ///
 /// # Examples
 /// ```
-/// use solmath_core::mul_div_ceil;
+/// use solmath::mul_div_ceil;
 /// assert_eq!(mul_div_ceil(100, 200, 300).unwrap(), 67);
 /// assert_eq!(mul_div_ceil(1, 1, 3).unwrap(), 1);
 /// ```

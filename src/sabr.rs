@@ -30,14 +30,14 @@ use crate::hp::{pow_fixed_hp, bs_full_hp};
 ///
 /// # Example
 /// ```
-/// use solmath_core::{sabr_implied_vol, SCALE};
+/// use solmath::{sabr_implied_vol, SCALE};
 /// // ATM SABR vol: F=100, K=100, T=1yr, alpha=0.2, beta=0.5, rho=-0.3, nu=0.4
 /// let vol = sabr_implied_vol(
 ///     100 * SCALE, 100 * SCALE, SCALE,
 ///     200_000_000_000, SCALE / 2, -300_000_000_000, 400_000_000_000,
 /// )?;
 /// assert!(vol > 0);
-/// # Ok::<(), solmath_core::SolMathError>(())
+/// # Ok::<(), solmath::SolMathError>(())
 /// ```
 pub fn sabr_implied_vol(
     f: u128, k: u128, t: u128,
@@ -934,4 +934,4 @@ mod tests {
 }
 
 #[cfg(test)]
-include!("../../../test_data/sabr_reference_tests.rs");
+include!("../test_data/sabr_reference_tests.rs");

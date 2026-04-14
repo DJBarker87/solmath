@@ -12,10 +12,10 @@ use crate::overflow::{checked_mul_div_i, checked_mul_div_u, checked_mul_div_rem_
 ///
 /// # Example
 /// ```
-/// use solmath_core::{fp_mul, SCALE};
+/// use solmath::{fp_mul, SCALE};
 /// let result = fp_mul(2 * SCALE, 3 * SCALE).unwrap();
 /// assert_eq!(result, 6 * SCALE);
-/// # Ok::<(), solmath_core::SolMathError>(())
+/// # Ok::<(), solmath::SolMathError>(())
 /// ```
 #[inline]
 pub fn fp_mul(a: u128, b: u128) -> Result<u128, SolMathError> {
@@ -34,7 +34,7 @@ pub fn fp_mul(a: u128, b: u128) -> Result<u128, SolMathError> {
 ///
 /// # Example
 /// ```
-/// use solmath_core::{fp_mul_i, SCALE_I};
+/// use solmath::{fp_mul_i, SCALE_I};
 /// let result = fp_mul_i(-2 * SCALE_I, 3 * SCALE_I).unwrap();
 /// assert_eq!(result, -6 * SCALE_I);
 /// ```
@@ -49,6 +49,7 @@ pub fn fp_mul_i(a: i128, b: i128) -> Result<i128, SolMathError> {
 /// Internal unchecked fixed-point multiply. Inputs MUST be bounded
 /// such that |a * b| < i128::MAX. No overflow check — caller's
 /// responsibility. Not exposed in public API.
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn fp_mul_i_fast(a: i128, b: i128) -> i128 {
     a * b / SCALE_I
@@ -101,10 +102,10 @@ pub fn fp_mul_i_round(a: i128, b: i128) -> Result<i128, SolMathError> {
 ///
 /// # Example
 /// ```
-/// use solmath_core::{fp_div, SCALE};
+/// use solmath::{fp_div, SCALE};
 /// let result = fp_div(10 * SCALE, 2 * SCALE).unwrap();
 /// assert_eq!(result, 5 * SCALE);
-/// # Ok::<(), solmath_core::SolMathError>(())
+/// # Ok::<(), solmath::SolMathError>(())
 /// ```
 #[inline]
 pub fn fp_div(a: u128, b: u128) -> Result<u128, SolMathError> {
@@ -175,6 +176,7 @@ pub fn fp_div_ceil(a: u128, b: u128) -> Result<u128, SolMathError> {
 /// Rounding signed division: (a × SCALE) / b, rounded to nearest.
 /// Same as fp_div_i but rounds instead of truncating. Returns `Err(Overflow)` on overflow.
 /// Internal — called by mills_ratio_cf8.
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn fp_div_i_round(a: i128, b: i128) -> Result<i128, SolMathError> {
     if b == 0 { return Err(SolMathError::DivisionByZero); }
@@ -249,6 +251,7 @@ pub(crate) fn fp_div_rem_experimental_u(a: u128, b: u128) -> Option<(u128, u128)
 }
 
 /// Integer square root via Newton's method. Internal — used by fp_sqrt.
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn isqrt_u128(n: u128) -> u128 {
     if n == 0 {
@@ -329,11 +332,11 @@ pub(crate) fn cmp_sqrt_candidate(candidate: u128, x: u128) -> core::cmp::Orderin
 ///
 /// # Example
 /// ```
-/// use solmath_core::{fp_sqrt, SCALE};
+/// use solmath::{fp_sqrt, SCALE};
 /// // sqrt(4.0) = 2.0
 /// let result = fp_sqrt(4 * SCALE).unwrap();
 /// assert_eq!(result, 2 * SCALE);
-/// # Ok::<(), solmath_core::SolMathError>(())
+/// # Ok::<(), solmath::SolMathError>(())
 /// ```
 pub fn fp_sqrt(x: u128) -> Result<u128, SolMathError> {
     if x == 0 {

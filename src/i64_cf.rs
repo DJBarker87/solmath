@@ -340,7 +340,7 @@ pub(crate) fn sqrt_h_pub(x: i64) -> i64 { sqrt_h(x) }
 mod tests {
     use super::*;
     use crate::transcendental::exp_fixed_i;
-    use crate::arithmetic::{fp_mul_i, fp_sqrt};
+    use crate::arithmetic::fp_mul_i;
 
     // Downscale from SCALE (1e12) to SCALE_H (2^20)
     fn to_h_test(v: i128) -> i64 {
