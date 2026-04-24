@@ -45,6 +45,7 @@ pub mod arithmetic;
 pub mod overflow;
 pub mod mul_div;
 pub mod double_word;
+pub mod encoding;
 mod utils;
 
 // Transcendental bundle
@@ -105,6 +106,7 @@ pub mod phi2table;
 pub use constants::{SCALE, SCALE_I, BsFull, LN2_LO, LN2_HP_LO, LN_REMEZ_COEFFS, LN_REMEZ_HP_COEFFS};
 pub use double_word::DoubleWord;
 pub use error::SolMathError;
+pub use encoding::{fp, fp_i};
 
 // Arithmetic
 pub use arithmetic::{
@@ -1570,7 +1572,7 @@ mod mul_div_u128_properties {
     }
 }
 
-// ── Cross-validation against Python reference vectors ──
+// ── Cross-validation against exact integer reference vectors ──
 #[cfg(test)]
 mod mul_div_cross_validation {
     use super::*;
@@ -1585,10 +1587,58 @@ mod mul_div_cross_validation {
     }
 
     #[test]
-    fn validate_against_python() {
-        let data = include_str!("../tests/reference/mul_div_vectors.json");
-        let vectors: alloc::vec::Vec<Vector> = serde_json::from_str(data).expect("parse vectors");
-        let total = vectors.len();
+    fn validate_against_exact_vectors() {
+        let vectors = [
+            Vector { a: 0, b: 0, c: 1, floor: 0, ceil: 0 },
+            Vector { a: 0, b: u64::MAX, c: 1, floor: 0, ceil: 0 },
+            Vector { a: u64::MAX, b: 1, c: 1, floor: u64::MAX, ceil: u64::MAX },
+            Vector { a: u64::MAX, b: 2, c: 2, floor: u64::MAX, ceil: u64::MAX },
+            Vector { a: 100, b: 200, c: 300, floor: 66, ceil: 67 },
+            Vector { a: 1, b: 1, c: 3, floor: 0, ceil: 1 },
+            Vector { a: 2, b: 1, c: 3, floor: 0, ceil: 1 },
+            Vector { a: 7, b: 3, c: 2, floor: 10, ceil: 11 },
+            Vector {
+                a: 1_000_000_000_000,
+                b: 50_000_000_000,
+                c: 100_000_000_000,
+                floor: 500_000_000_000,
+                ceil: 500_000_000_000,
+            },
+            Vector {
+                a: 10_u64.pow(18),
+                b: 10_u64.pow(12),
+                c: 10_u64.pow(12),
+                floor: 10_u64.pow(18),
+                ceil: 10_u64.pow(18),
+            },
+            Vector { a: u64::MAX, b: u64::MAX, c: u64::MAX, floor: u64::MAX, ceil: u64::MAX },
+        ];
+
+        for v in &vectors {
+            let f = mul_div_floor(v.a, v.b, v.c).unwrap();
+            let ce = mul_div_ceil(v.a, v.b, v.c).unwrap();
+            if f != v.floor {
+                panic!("FLOOR mismatch: a={} b={} c={} expected={} got={}", v.a, v.b, v.c, v.floor, f);
+            }
+            if ce != v.ceil {
+                panic!("CEIL mismatch: a={} b={} c={} expected={} got={}", v.a, v.b, v.c, v.ceil, ce);
+            }
+        }
+    }
+
+    #[test]
+    fn validate_against_full_python_vectors_when_requested() {
+        if std::env::var("SOLMATH_FULL_VECTORS").ok().as_deref() != Some("1") {
+            std::eprintln!("set SOLMATH_FULL_VECTORS=1 to run the full mul-div vector corpus");
+            return;
+        }
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/reference/mul_div_vectors.json");
+        let data = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("Cannot read {:?}", path));
+        let vectors: alloc::vec::Vec<Vector> = serde_json::from_str(&data).expect("parse vectors");
+
         for v in &vectors {
             let f = mul_div_floor(v.a, v.b, v.c).unwrap();
             let ce = mul_div_ceil(v.a, v.b, v.c).unwrap();
@@ -1600,6 +1650,6 @@ mod mul_div_cross_validation {
             }
         }
 
-        assert_eq!(total, vectors.len(), "{} vectors validated", total);
+        assert!(!vectors.is_empty(), "full vector corpus should not be empty");
     }
 }

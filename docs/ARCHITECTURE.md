@@ -202,16 +202,15 @@ for everything, or `default-features = false` for core arithmetic only.
 
 ## Validation assets
 
-The crate ships the reference assets needed by its test suite:
+The crate ships the compact reference assets needed by its test suite:
 
-- `tests/reference/mul_div_vectors.json` — floor/ceil mul-div cross-check vectors
 - `benchmark/iv_vectors.json` — implied-vol recovery vectors used by the crate test suite
 - `test_data/heston_reference_tests.rs` — generated Heston reference cases
 - `test_data/sabr_reference_tests.rs` — generated SABR reference cases
 
-These are included directly from crate-local paths in the `#[cfg(test)]`
-modules so `cargo test` can run from this repository without depending on a
-separate checkout.
+Larger generated corpora and Python generation scripts stay repository-only so
+the crates.io package remains small. See `VALIDATION.md` for the exact split and
+release commands.
 
 ---
 

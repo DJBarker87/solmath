@@ -2,6 +2,9 @@
 
 Financial math that fits on Solana.
 
+[![Crates.io](https://img.shields.io/crates/v/solmath.svg)](https://crates.io/crates/solmath)
+[![Docs.rs](https://docs.rs/solmath/badge.svg)](https://docs.rs/solmath)
+[![CI](https://github.com/DJBarker87/solmath/actions/workflows/ci.yml/badge.svg)](https://github.com/DJBarker87/solmath/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
 - **9-22x faster** than `rust_decimal` for transcendentals, **10-23x faster** than `brine-fp`
@@ -9,7 +12,7 @@ Financial math that fits on Solana.
 - **10-14 sig figs** vs QuantLib on the HP Black-Scholes path
 - **Proved error bounds** for core primitives ([PROOFS.md](PROOFS.md))
 - **European barrier options** — all 4 types (down/up × in/out), ~263K CU, validated against QuantLib on 443K vectors
-- **Reproducible validation** — 2.5M+ vectors checked against mpmath, scipy, and QuantLib, with bundled fixture files for the crate test suite
+- **Reproducible validation** — compact fixtures ship in the crate; full 2.5M+ vector generation/checks live in the repo
 
 `no_std` | zero dependencies | pure integer arithmetic
 
@@ -35,14 +38,15 @@ Measured on-chain (50,000 production vectors, Solana localnet):
 ```rust
 use solmath::*;
 
-// All values are i128/u128 scaled by SCALE (1e12).
-// 1.5 → 1_500_000_000_000.  0.05 → 50_000_000_000.
+// fp("...") parses decimal strings into SCALE = 1e12 fixed-point integers.
+// Use it in tests, clients, scripts, and off-chain config. On-chain programs
+// should receive already-validated integers across instruction data.
 
-let s = 100 * SCALE;                    // spot = $100
-let k = 105 * SCALE;                    // strike = $105
-let r = 50_000_000_000u128;             // risk-free rate = 5%
-let sigma = 200_000_000_000u128;        // volatility = 20%
-let t = SCALE;                          // time to expiry = 1 year
+let s = fp("100")?;      // spot = $100
+let k = fp("105")?;      // strike = $105
+let r = fp("0.05")?;     // risk-free rate = 5%
+let sigma = fp("0.20")?; // volatility = 20%
+let t = fp("1")?;        // time to expiry = 1 year
 
 let greeks = bs_full_hp(s, k, r, sigma, t)?;
 // greeks.call  ≈ $8.02
@@ -120,9 +124,19 @@ All well under Solana's 10 MB program limit. LTO strips unused code paths even w
 - **No panics** in any public function for valid-range inputs. Internal assertions are guarded by input clamping
 - **No silent sentinels** — every fallible function returns `Result<T, SolMathError>`
 - **Error variants:** `DomainError` (invalid input), `Overflow` (result too large), `DivisionByZero`, `NoConvergence` (iterative methods)
-- **Total functions** (valid for all inputs, e.g. `sin_fixed`, `norm_cdf_poly`) return bare types
+- **No silent decimal truncation** — `fp("...")` rejects non-zero digits beyond 12 decimal places
 - **Overflow detection:** `fp_mul`, `fp_mul_i`, `fp_mul_round`, `fp_mul_i_round` return `Err(Overflow)` on overflow — no silent saturation or wrap-around. Use `checked_mul_div_i` for an exact multiply-then-divide in one step
 - **Internal arithmetic:** Remez polynomials for ln/exp, boundary-constrained CDF — all validated on 100K+ vectors
+
+## Validation & Audit Status
+
+See [VALIDATION.md](VALIDATION.md) for exact release commands, CI checks,
+reference assets, and the production-readiness matrix. No independent
+third-party audit is claimed; treat SolMath as unaudited financial
+infrastructure until your integration has its own review.
+
+Copy-paste examples live in [examples/](examples/), including options pricing,
+weighted pool swaps, safe token conversion, and an Anchor instruction template.
 
 ## At a Glance
 
@@ -441,6 +455,8 @@ norm_cdf_poly_hp(x: i128) -> Result<i128, SolMathError>         // HP variant, 5
 ### Arithmetic
 
 ```rust
+fp(decimal: &str) -> Result<u128, SolMathError>       // decimal parser for off-chain/test config
+fp_i(decimal: &str) -> Result<i128, SolMathError>     // signed decimal parser
 fp_mul(a: u128, b: u128) -> Result<u128, SolMathError>          // truncating
 fp_mul_round(a: u128, b: u128) -> Result<u128, SolMathError>    // rounding (≤ 0.5 ULP)
 fp_mul_i(a: i128, b: i128) -> Result<i128, SolMathError>        // truncating
