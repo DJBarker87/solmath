@@ -28,6 +28,12 @@ place) = 1 in the integer representation = 10^-12 in real terms.
 | 0.20 (20%) | 200,000,000,000 | `200_000_000_000` |
 | -0.7 | -700,000,000,000 | `-700_000_000_000i128` |
 
+The crate also exposes `fp("...") -> Result<u128, SolMathError>` and
+`fp_i("...") -> Result<i128, SolMathError>` for clients, tests, scripts, and
+off-chain config. These helpers reject non-zero digits beyond 12 decimal places.
+On-chain programs should generally receive already-validated fixed-point
+integers in instruction data.
+
 ### Signedness
 
 - **Prices, rates, volatilities, times** — `u128` (always non-negative).
@@ -132,6 +138,7 @@ solmath/src/
 ├── overflow.rs       U256, checked_mul_div_* (wide arithmetic)
 ├── mul_div.rs        mul_div_floor/ceil at u64 and u128
 ├── double_word.rs    DoubleWord sub-ULP accumulator
+├── encoding.rs       fp/fp_i decimal parsing helpers
 │
 ├── transcendental.rs ln_fixed_i, exp_fixed_i, pow_fixed, expm1_fixed
 ├── trig.rs           sin_fixed, cos_fixed, sincos_fixed
@@ -159,7 +166,7 @@ Every module beyond `core` is feature-gated. The dependency graph:
 
 ```
 core (always on)
-  arithmetic, overflow, mul_div, double_word, constants, error
+  arithmetic, overflow, mul_div, double_word, encoding, constants, error
 
 transcendental (default)
   transcendental, trig, normal, hp, i64_math
@@ -196,17 +203,19 @@ table-gen
 ```
 
 Default features: `transcendental + complex`. Use `features = ["full"]`
-for everything, or `default-features = false` for core arithmetic only.
+for production runtime modules, or `default-features = false` for core
+arithmetic only. `table-gen`, `pade-iv`, and `idl-build` are explicit opt-ins.
 
 ---
 
 ## Validation assets
 
-The crate ships the compact reference assets needed by its test suite:
+The crate ships compact reference assets for reproducibility and generated
+tests:
 
-- `benchmark/iv_vectors.json` — implied-vol recovery vectors used by the crate test suite
-- `test_data/heston_reference_tests.rs` — generated Heston reference cases
-- `test_data/sabr_reference_tests.rs` — generated SABR reference cases
+- `benchmark/iv_vectors.json` — compact implied-vol recovery vectors for regression validation
+- `test_data/heston_reference_tests.rs` — generated Heston reference cases used by the crate test suite
+- `test_data/sabr_reference_tests.rs` — generated SABR reference cases used by the crate test suite
 
 Larger generated corpora and Python generation scripts stay repository-only so
 the crates.io package remains small. See `VALIDATION.md` for the exact split and

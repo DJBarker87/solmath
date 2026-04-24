@@ -116,7 +116,7 @@ impl Phi2Table {
     /// # Errors
     ///
     /// Returns `Ok` for all inputs. Cannot fail in practice — the `Result`
-    /// wrapper is for API consistency with [`bvn_cdf`](crate::bvn_cdf).
+    /// wrapper is for API consistency with [`bvn_cdf`](crate::bvn_cdf()).
     pub fn eval(&self, a: i128, b: i128) -> Result<i128, SolMathError> {
         let a64 = (a.clamp(DOMAIN_MIN as i128, DOMAIN_MAX as i128)) as i64;
         let b64 = (b.clamp(DOMAIN_MIN as i128, DOMAIN_MAX as i128)) as i64;

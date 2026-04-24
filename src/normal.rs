@@ -147,6 +147,7 @@ pub fn norm_cdf_and_pdf(x: i128) -> Result<(i128, i128), SolMathError> {
 }
 
 /// BS-guarded CDF+PDF: short-circuits to (0,0)/(SCALE,0) beyond ±8σ. Internal.
+#[cfg(feature = "bs")]
 pub(crate) fn norm_cdf_and_pdf_bs_guarded(x: i128) -> Result<(i128, i128), SolMathError> {
     if x <= -8 * SCALE_I {
         return Ok((0, 0));
@@ -255,4 +256,3 @@ pub fn inverse_norm_cdf(p: i128) -> Result<i128, SolMathError> {
         if q < 0 { Ok(-ret) } else { Ok(ret) }
     }
 }
-

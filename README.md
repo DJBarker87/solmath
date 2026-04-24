@@ -4,11 +4,10 @@ Financial math that fits on Solana.
 
 [![Crates.io](https://img.shields.io/crates/v/solmath.svg)](https://crates.io/crates/solmath)
 [![Docs.rs](https://docs.rs/solmath/badge.svg)](https://docs.rs/solmath)
-[![CI](https://github.com/DJBarker87/solmath/actions/workflows/ci.yml/badge.svg)](https://github.com/DJBarker87/solmath/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
 - **9-22x faster** than `rust_decimal` for transcendentals, **10-23x faster** than `brine-fp`
-- **Black Scholes Option Price + all 5 Greeks in ~50K CU** — one Solana instruction, room to spare
+- **Standard Black-Scholes price + all 5 Greeks in ~50K CU** — HP path averages ~118K CU
 - **10-14 sig figs** vs QuantLib on the HP Black-Scholes path
 - **Proved error bounds** for core primitives ([PROOFS.md](PROOFS.md))
 - **European barrier options** — all 4 types (down/up × in/out), ~263K CU, validated against QuantLib on 443K vectors
@@ -76,7 +75,7 @@ solmath = { version = "0.1", default-features = false, features = ["heston"] }
 
 | Feature | Modules | Dependencies |
 |---------|---------|--------------|
-| *(core)* | arithmetic, mul_div, overflow, constants, error, double_word | — |
+| *(core)* | arithmetic, mul_div, overflow, encoding, constants, error, double_word | — |
 | `transcendental` | ln, exp, pow, sin, cos, norm_cdf, norm_pdf, HP variants | — |
 | `complex` | complex arithmetic | transcendental |
 | `bs` | Black-Scholes pricing + Greeks | transcendental |
@@ -88,10 +87,10 @@ solmath = { version = "0.1", default-features = false, features = ["heston"] }
 | `pool` | weighted pool swap math | transcendental |
 | `bivariate` | bivariate normal CDF (GL6 + table lookup) | transcendental |
 | `table-gen` | offline Φ₂ table generation | bivariate |
-| `full` | everything above | all |
+| `full` | production runtime modules | transcendental, complex, bs, iv, barrier, nig, heston, sabr, pool, bivariate |
 | `pade-iv` | experimental Padé IV guess | iv |
 
-Default features: **core + transcendental + complex** — everything needed for general-purpose fixed-point math, logarithms, exponentials, trigonometry, and normal distribution. Pricing models (BS, IV, Heston, SABR, barrier, NIG) and pool math are opt-in. Use `features = ["full"]` for everything, or `default-features = false` for core arithmetic only.
+Default features: **core + transcendental + complex** — everything needed for general-purpose fixed-point math, logarithms, exponentials, trigonometry, and normal distribution. Pricing models (BS, IV, Heston, SABR, barrier, NIG), pool math, and bivariate CDFs are opt-in. Use `features = ["full"]` for production runtime modules, or `default-features = false` for core arithmetic only. `table-gen`, `pade-iv`, and `idl-build` remain explicit opt-ins.
 
 ### Binary Size
 
@@ -121,8 +120,8 @@ All well under Solana's 10 MB program limit. LTO strips unused code paths even w
 
 ## Safety Model
 
-- **No panics** in any public function for valid-range inputs. Internal assertions are guarded by input clamping
-- **No silent sentinels** — every fallible function returns `Result<T, SolMathError>`
+- **No panics in the production public API** — invalid domains, overflow, division by zero, and non-convergence return `Result` errors
+- **Explicit failure modes** — invalid domains, overflow, division by zero, and non-convergence return `SolMathError`; documented clamps/underflows are intentional boundary behavior
 - **Error variants:** `DomainError` (invalid input), `Overflow` (result too large), `DivisionByZero`, `NoConvergence` (iterative methods)
 - **No silent decimal truncation** — `fp("...")` rejects non-zero digits beyond 12 decimal places
 - **Overflow detection:** `fp_mul`, `fp_mul_i`, `fp_mul_round`, `fp_mul_i_round` return `Err(Overflow)` on overflow — no silent saturation or wrap-around. Use `checked_mul_div_i` for an exact multiply-then-divide in one step
@@ -130,12 +129,13 @@ All well under Solana's 10 MB program limit. LTO strips unused code paths even w
 
 ## Validation & Audit Status
 
-See [VALIDATION.md](VALIDATION.md) for exact release commands, CI checks,
+See [VALIDATION.md](VALIDATION.md) for exact release commands, package checks,
 reference assets, and the production-readiness matrix. No independent
 third-party audit is claimed; treat SolMath as unaudited financial
 infrastructure until your integration has its own review.
 
-Copy-paste examples live in [examples/](examples/), including options pricing,
+Copy-paste Solana integration paths live in [INTEGRATION.md](INTEGRATION.md).
+Runnable examples live in [examples/](examples/), including options pricing,
 weighted pool swaps, safe token conversion, and an Anchor instruction template.
 
 ## At a Glance
@@ -143,7 +143,7 @@ weighted pool swaps, safe token conversion, and an Anchor instruction template.
 | Function | Median err | Max $ error | Avg CU | Max CU |
 |----------|-----------|-------------|--------|--------|
 | **bs_full_hp** | **0** | **$0.000000000004** | **118K** | **165K** |
-| bs_price_hp | 0 | $0.000000000004 | ~60K | ~80K |
+| black_scholes_price_hp | 0 | $0.000000000004 | ~60K | ~80K |
 | bs_full | 209 | $0.000003 | 50K | 68K |
 | barrier_option | 1 | $0.000002 | 263K | 385K ¹ |
 | implied_vol | 4 ⁴ | — | 157K | 396K ¹ |
@@ -450,6 +450,11 @@ norm_cdf_poly(x: i128) -> Result<i128, SolMathError>            // Phi(x), piece
 norm_pdf(x: i128) -> Result<i128, SolMathError>                 // phi(x) = exp(-x^2/2)/sqrt(2pi), 2 ULP
 norm_cdf_and_pdf(x: i128) -> Result<(i128, i128), SolMathError> // both at once
 norm_cdf_poly_hp(x: i128) -> Result<i128, SolMathError>         // HP variant, 5 ULP at 1e15 scale, ~24K CU
+bvn_cdf(a: i128, b: i128, rho: i128) -> Result<i128, SolMathError> // Phi2(a,b;rho), ~129K CU
+bvn_cdf_hp(a: i128, b: i128, rho: i128) -> Result<i128, SolMathError> // offline/table-generation reference
+Phi2Table::from_array(values: [[i32; 64]; 64]) -> Phi2Table
+Phi2Table::eval(&self, a: i128, b: i128) -> Result<i128, SolMathError> // fixed-rho lookup, 943 CU
+Phi2Table::generate(rho: i128, n: usize) -> Result<Phi2Table, SolMathError> // requires table-gen
 ```
 
 ### Arithmetic
@@ -461,7 +466,7 @@ fp_mul(a: u128, b: u128) -> Result<u128, SolMathError>          // truncating
 fp_mul_round(a: u128, b: u128) -> Result<u128, SolMathError>    // rounding (≤ 0.5 ULP)
 fp_mul_i(a: i128, b: i128) -> Result<i128, SolMathError>        // truncating
 fp_mul_i_round(a: i128, b: i128) -> Result<i128, SolMathError>  // rounding (≤ 0.5 ULP)
-fp_mul_i_round_dw(a: i128, b: i128) -> DoubleWord      // rounding + sub-ULP remainder
+fp_mul_i_round_dw(a: i128, b: i128) -> Result<DoubleWord, SolMathError> // rounding + sub-ULP remainder
 fp_div(a: u128, b: u128) -> Result<u128, SolMathError>  // truncating, overflow-safe via U256
 fp_div_round(a: u128, b: u128) -> Result<u128, SolMathError> // rounding (≤ 0.5 ULP)
 fp_div_i(a: i128, b: i128) -> Result<i128, SolMathError> // signed, overflow-safe
@@ -576,6 +581,7 @@ Every accuracy number is independently reproducible. References computed with [m
 100K stratified production vectors per function (regime-bucketed, not uniform random). 443K barrier vectors from QuantLib's AnalyticBarrierEngine. 10K adversarial vectors targeting cancellation regions and overflow boundaries. Formal proofs for core primitives in [PROOFS.md](PROOFS.md).
 
 ```bash
+# From a full repository checkout:
 pip install -r scripts/requirements.txt
 python3 scripts/generate_production_vectors.py
 python3 scripts/generate_adversarial_vectors.py

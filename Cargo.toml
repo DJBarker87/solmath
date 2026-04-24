@@ -1,6 +1,6 @@
 [package]
 name = "solmath"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 rust-version = "1.79"
 description = "Fixed-point financial math for Solana. Black-Scholes, Greeks, IV, NIG pricing, pool math — pure integer arithmetic, no_std, zero dependencies."
@@ -12,6 +12,7 @@ readme = "README.md"
 include = [
     "Cargo.toml",
     "README.md",
+    "INTEGRATION.md",
     "SECURITY.md",
     "USAGE.md",
     "PROOFS.md",
@@ -46,11 +47,6 @@ idl-build = []
 
 [dependencies]
 # Zero dependencies — pure Rust, no_std
-
-[dev-dependencies]
-proptest = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 
 [[example]]
 name = "options_pricing"

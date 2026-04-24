@@ -6,7 +6,7 @@ contracts and internal fast paths.
 
 ---
 
-## No panics in production code
+## No panics in the production public API
 
 All public functions are either infallible or return `Result<_, SolMathError>`.
 The four error variants and their triggers:
@@ -18,9 +18,10 @@ The four error variants and their triggers:
 | `DivisionByZero` | Divisor is zero in a divide operation |
 | `NoConvergence` | Iterative solver (implied_vol) ran out of iterations |
 
-The only `panic!`/`unwrap`/`expect` calls in the crate appear in `#[cfg(test)]`
-blocks and in `debug_assert!` statements, which are compiled out in release
-builds (including all Solana `.so` deployments).
+The only `panic!`/`unwrap`/`expect` calls found in the crate are in tests,
+rustdoc examples, test-only helpers, and `debug_assert!` statements. The
+`debug_assert!` checks are compiled out in release builds, including Solana
+`.so` deployments.
 
 ---
 
@@ -143,7 +144,7 @@ than looping forever.
 ## Audit history
 
 No independent third-party audit is claimed for the published crate. The
-current public validation consists of reproducible reference vectors, property
-tests, and internal review documented in `PROOFS.md` and the generated test
-data. Treat financial-model use as unaudited until your integration has its own
-review.
+current public validation consists of reproducible reference vectors,
+deterministic property-style tests, and internal review documented in
+`PROOFS.md` and the generated test data. Treat financial-model use as unaudited
+until your integration has its own review.

@@ -1,17 +1,34 @@
 # SolMath — Usage Guide
 
-Worked examples for every major feature. All code compiles standalone with
-`solmath = { version = "0.1", features = ["full"] }`.
+Worked examples for every major runtime feature. All code compiles standalone
+with `solmath = { version = "0.1", features = ["full"] }`. Offline table
+generation requires the additional `table-gen` feature.
 
 See the generated rustdoc API and the function table in `README.md` for
-complete signatures, CU costs, and ULP accuracy.
+complete signatures, CU costs, and ULP accuracy. For Anchor/Solana instruction
+templates with compute-budget guidance, see `INTEGRATION.md`.
 
 ---
 
 ## Fixed-point encoding
 
 Every value is a `u128` or `i128` integer scaled by `SCALE = 1_000_000_000_000`
-(1e12). To encode a real number, multiply by SCALE:
+(1e12). In clients, tests, scripts, and off-chain config, use `fp` / `fp_i`:
+
+```rust
+use solmath::{fp, fp_i};
+
+let spot = fp("100")?;
+let rate = fp("0.05")?;
+let rho = fp_i("-0.70")?;
+
+// Non-zero digits beyond 12 decimal places are rejected.
+assert!(fp("1.0000000000001").is_err());
+# Ok::<(), solmath::SolMathError>(())
+```
+
+On-chain programs should receive already-validated integers across instruction
+data. To encode a real number by hand, multiply by SCALE:
 
 ```rust
 use solmath::SCALE;
@@ -150,9 +167,37 @@ let (cdf_val, pdf_val) = norm_cdf_and_pdf(SCALE_I)?; // at x = 1.0
 
 ---
 
+## Bivariate normal CDF
+
+```rust
+use solmath::*;
+
+// Phi2(-0.5, 0.3; 0.85)
+let a = fp_i("-0.5")?;
+let b = fp_i("0.3")?;
+let rho = fp_i("0.85")?;
+let prob = bvn_cdf(a, b, rho)?;
+// prob is an i128 probability at SCALE.
+
+// Fixed-rho hot path: embed a precomputed 64x64 SCALE_6 table.
+// Replace this placeholder with values generated offline.
+let table = Phi2Table::from_array([[0i32; 64]; 64]);
+let fast_prob = table.eval(a, b)?;
+# let _ = (prob, fast_prob);
+# Ok::<(), SolMathError>(())
+```
+
+Use `bvn_cdf` for arbitrary correlation. Use `Phi2Table::eval` when a protocol
+has a fixed correlation and needs the ~943 CU lookup path. `Phi2Table::generate`
+is behind `table-gen` and is intended for native/off-chain table generation.
+
+---
+
 ## Black-Scholes (HP)
 
-The HP path gives 10-14 significant figures in ~50K CU (prices + all 5 Greeks):
+The HP path gives 10-14 significant figures in ~118K CU average for prices plus
+all 5 Greeks. The standard `bs_full` path is the ~50K CU option when lower
+precision is acceptable:
 
 ```rust
 use solmath::*;
@@ -167,7 +212,7 @@ let t     = SCALE;                 // 1 year
 let (call, put) = black_scholes_price_hp(s, k, r, sigma, t)?;
 // call ≈ $8.02, put ≈ $7.90
 
-// Full Greeks (~130K CU)
+// Full Greeks (~118K CU average, ~165K max in the benchmark set)
 let g = bs_full_hp(s, k, r, sigma, t)?;
 // g.call, g.put          — option prices
 // g.call_delta, g.put_delta — deltas (signed)
@@ -209,7 +254,9 @@ let sigma_recovered = implied_vol(call, s, k, r, t)?;
 ```
 
 The solver uses Li rational initial guess + Halley refinement + Jaeckel
-rational. Typical cost: 30-60K CU.
+rational. Typical cost is ~149K CU median / ~157K CU average; worst cases in
+the benchmark set reached ~396K CU, so on-chain callers should request a higher
+compute budget for IV.
 
 ---
 
@@ -401,6 +448,12 @@ solmath = { version = "0.1", default-features = false, features = ["iv"] }
 
 # Everything
 solmath = { version = "0.1", features = ["full"] }
+
+# Bivariate CDF only
+solmath = { version = "0.1", default-features = false, features = ["bivariate"] }
+
+# Offline Phi2 table generation
+solmath = { version = "0.1", default-features = false, features = ["table-gen"] }
 ```
 
 Feature dependency graph:
@@ -408,9 +461,13 @@ Feature dependency graph:
 ```
 core (always on)
 ├── transcendental ← complex ← nig
-│                  ← bs ← iv
+│                  ← bs ← iv ← pade-iv
 │                  ←    ← heston (also needs complex)
 │                  ← barrier
 │                  ← sabr
 │                  ← pool
+│                  ← bivariate ← table-gen
 ```
+
+`full` enables the production runtime features through `bivariate`. It does not
+enable `table-gen`, `pade-iv`, or `idl-build`; opt into those explicitly.

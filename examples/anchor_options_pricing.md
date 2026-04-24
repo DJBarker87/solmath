@@ -8,7 +8,7 @@ program receives already-validated `u128` values scaled by `SCALE = 1e12`.
 
 ```toml
 [dependencies]
-anchor-lang = "0.31"
+anchor-lang = { version = "0.31", features = ["init-if-needed"] }
 solmath = { version = "0.1", default-features = false, features = ["transcendental"] }
 ```
 

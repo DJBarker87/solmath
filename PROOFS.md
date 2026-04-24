@@ -5,7 +5,7 @@ SCALE = 10^12 (or SCALE_HP = 10^15 where noted): an error of 1 means the compute
 integer result differs from the ideal real-valued result by at most 1 in the
 least-significant fixed-point unit.
 
-All line references are to `crate/solmath/src/`.
+All source references are to files under `src/`.
 
 **Disclaimer:** The methodology and assumptions in this document are sound to the
 author's knowledge, but the proofs themselves were generated with AI assistance and
@@ -13,12 +13,12 @@ have not been independently verified. The discerning reader should reproduce any
 result before relying on it. The empirical benchmarks were run by the author and are
 the primary accuracy reference.
 
-**Certificate script status:** The Lipschitz certificate scripts
-(`lipschitz_certificate.py`, `trig_lipschitz_certificate.py`) must be present in the
-repository and reproducible. If these scripts are missing, the polynomial
-certification chain for Propositions 6, 9, and 10 is non-reproducible and should be
-treated as unverified until the scripts are restored and re-run against the current
-source.
+**Certificate script status:** The Lipschitz certificate scripts referenced below
+(`lipschitz_certificate.py`, `trig_lipschitz_certificate.py`) are not included in
+the current crate package. The polynomial certification chain for Propositions 6,
+9, and 10 should be treated as non-reproducible until those scripts are restored
+and re-run against the current source. The empirical benchmark results remain the
+primary accuracy reference.
 
 -----
 
@@ -91,8 +91,8 @@ The same pattern applies to `checked_add`, `checked_sub`, etc.
 **(R5) Overflow behaviour is defined.** In debug mode, integer overflow on `+`, `-`,
 `*` panics. In release mode, it wraps (two's complement for signed types, modular
 for unsigned). The `wrapping_*`, `saturating_*`, and `checked_*` method families
-provide explicit control. The library uses `checked_mul` (R4) and `saturating_add`
-at overflow-sensitive points.
+provide explicit control. The library uses checked arithmetic and explicit
+`Result` errors at overflow-sensitive points.
 
 These five properties are referenced throughout the proofs as **(R1)**–**(R5)**.
 
@@ -204,8 +204,8 @@ fundamental building blocks and are used repeatedly by the main propositions.
 |fp_mul_i(a, b) - (a * b) / SCALE| < 1 ULP.
 ```
 
-When `trunc((a * b) / SCALE)` does not fit in i128, the function saturates to
-`i128::MAX` or `i128::MIN`.
+When `trunc((a * b) / SCALE)` does not fit in i128, the function returns
+`Err(Overflow)`.
 
 The true value is `f(a,b) = (a * b) / SCALE` (real-valued division).
 
@@ -225,8 +225,8 @@ Since `0 <= |(a*b) mod SCALE| < SCALE`, the error lies in [0, 1).
 `checked_mul_div_i(a, b, SCALE)` (Lemma 3), which computes `trunc((a * b) / SCALE)`
 exactly via U256 arithmetic. If the exact result fits in i128, the error is the same
 truncation remainder (in [0, 1)). If it does not fit, `checked_mul_div_i` returns
-`None` and the function saturates. The fast path adds zero overhead (a single `imul`
-+ overflow flag check); the widened path fires only for extreme inputs. □
+`Err(Overflow)`. The fast path adds zero overhead (a single `imul` + overflow flag
+check); the widened path fires only for extreme inputs. □
 
 *Remark (Empirical validation).* Max observed error = 1 ULP across benchmark vectors
 (production suite: fp_mul_i max ULP = 0 across 95K vectors; on-chain harness max = 1). The bound is
@@ -251,10 +251,11 @@ final truncation remainder, which is strictly less than one ULP.
 
 The true value is `f(a,b) = a * SCALE / b` (real-valued).
 
-**Implementation.** `fp_div(a, b)` calls `fp_div_rem_experimental_u(a, b)` and
-returns the quotient, or `u128::MAX` on overflow/division-by-zero. The core
-function `fp_div_rem_experimental_u` computes `floor(a * SCALE / b)` and
-`(a * SCALE) mod b` via three paths:
+**Implementation.** `fp_div(a, b)` returns `Err(DivisionByZero)` when `b == 0`.
+Otherwise it calls `fp_div_rem_experimental_u(a, b)` and returns the quotient, or
+`Err(Overflow)` if the quotient cannot be represented. The core function
+`fp_div_rem_experimental_u` computes `floor(a * SCALE / b)` and `(a * SCALE) mod b`
+via three paths:
 
 **Path 1** (thin, `arithmetic.rs:131-134`): When `a <= FP_DIV_THIN_MAX` (= u128::MAX / SCALE):
 
@@ -323,10 +324,9 @@ The sign logic and i128 range check are exact. Truncation is toward zero, consis
 with Rust integer division semantics by **(R2)**. The same conclusion applies: exact
 `trunc(a * SCALE / b)`, with the only error being the truncation remainder. □
 
-*Remark (Saturation).* When `fp_div_rem_experimental_u` returns `None` (quotient
-overflows u128, or `q > FP_DIV_THIN_MAX` in Path 2), `fp_div` returns `u128::MAX`.
-This is a saturation sentinel, not a mathematical result, and the < 1 ULP bound does
-not apply.
+*Remark (Overflow).* When `fp_div_rem_experimental_u` returns `None` (quotient
+overflows u128, or `q > FP_DIV_THIN_MAX` in Path 2), `fp_div` returns
+`Err(Overflow)`. The < 1 ULP bound applies only to `Ok` results.
 
 *Remark (fp_div_ceil and fp_div_floor).* `fp_div_ceil` (`arithmetic.rs:85-90`) uses
 the exact remainder from `fp_div_rem_experimental_u`: if `rem > 0`, it adds 1 to the
@@ -545,7 +545,7 @@ registers as 1 ULP in the integer-valued benchmark.
 All three variants compute fixed-point multiplication at SCALE_HP = 10^15.
 
 **Statement.** For each variant, `|f-hat(a,b) - a*b/SCALE_HP| <= 0.5 ULP`
-when no saturation or overflow occurs.
+when `Ok(result)` is returned.
 
 #### 2a. fp_mul_hp_u — overflow-safe unsigned
 
@@ -592,8 +592,7 @@ Rounding division by SCALE_HP by **(R2)**: `|(a*b + S/2)/S - a*b/S| <= 0.5`. □
 
 **Source:** `hp.rs:41-61`
 
-**Statement.** When the result does not saturate and the intermediate
-`|r| * SCALE_HP` does not overflow i128, `fp_div_hp_safe` computes
+**Statement.** When `Ok(result)` is returned, `fp_div_hp_safe` computes
 `trunc(a * SCALE_HP / b)` exactly. The error relative to real-valued division
 is strictly less than one HP-scale ULP.
 
@@ -602,8 +601,8 @@ is strictly less than one HP-scale ULP.
 ```
 q = a / b                    (exact integer quotient)
 r = a % b                    (exact remainder)
-q_scaled = q * SCALE_HP      (checked — saturates on overflow)
-r_scaled = (r * SCALE_HP) / b
+q_scaled = q * SCALE_HP      (checked — returns Err on overflow)
+r_scaled = (r * SCALE_HP) / b, using U256 fallback if r*SCALE_HP overflows i128
 result = q_scaled + r_scaled
 ```
 
@@ -621,9 +620,9 @@ division, and `q*S` is an exact integer, the truncation of the full expression
 *Remark (Overflow on remainder path — resolved).* The remainder path originally
 used `checked_mul_div_i(r, SCALE_HP, b)` (Lemma 3) but fell back to 0 on overflow
 via `unwrap_or(0)` — silently returning an incorrect result. This has been fixed:
-the fallback now saturates to `i128::MAX` or `i128::MIN` depending on sign,
-consistent with the `q * SCALE_HP` overflow handling on line 49. The overflow occurs
-when `|r| > i128::MAX / SCALE_HP` (≈ 1.7 × 10^23), requiring `|b| > 1.7 × 10^23`
+the fallback now uses `checked_mul_div_i(r, SCALE_HP, b)?`, which computes through
+U256 or returns `Err(Overflow)`. The direct `r * SCALE_HP` overflow occurs when
+`|r| > i128::MAX / SCALE_HP` (≈ 1.7 × 10^23), requiring `|b| > 1.7 × 10^23`
 — well beyond typical HP-scale inputs.
 
 -----
@@ -1090,8 +1089,8 @@ with 4 × 2^k amplification); max 1 ULP in financial domain (|x| < 20*SCALE).
 Production suite: 100K vectors.
 
 *Remark (Domain guards).* The code returns `Ok(0)` for x <= -40*SCALE (underflow
-to zero) and `Err(Overflow)` for x >= 40*SCALE. These are not sentinel values —
-they are explicit error returns via the `Result` type.
+to zero) and `Err(Overflow)` for x >= 40*SCALE. These are documented boundary
+behaviours; the high-side overflow is reported through `Result`.
 
 -----
 
@@ -1399,8 +1398,9 @@ output = checked_mul_div_u(int_result, frac_result, SCALE)
 
 *Proof.*
 
-*(A) upscale_std_to_hp.* Computes `min(x, i128::MAX/1000) * 1000` — clamped
-multiplication. Exact within the stated domain by **(R1)**. 0 error.
+*(A) upscale_std_to_hp.* Checks `x <= i128::MAX / 1000`, then computes
+`x * 1000`. Exact within the stated domain by **(R1)**; returns `Err(Overflow)`
+outside it. 0 error for `Ok` results.
 
 *(B) ln_fixed_hp.* The compensated Remez approach with DoubleWord propagation
 achieves <= 2 HP-scale units. The key improvements over `ln_fixed_i` (Proposition 7):
@@ -1532,15 +1532,15 @@ consistent with the attenuation effect dominating in practice.
 
 |Function                    |Cat.|Bound                                                 |Observed / note        |Domain                             |
 |----------------------------|----|------------------------------------------------------|-----------------------|-----------------------------------|
-|fp_mul_i (Lemma 1)          |A   |< 1 (truncation remainder)                            |1                      |all i128; saturates on overflow    |
+|fp_mul_i (Lemma 1)          |A   |< 1 (truncation remainder)                            |1                      |returns Err on overflow            |
 |fp_sqrt Path B (Prop. 1)    |A   |< 1 (exact by 256-bit bisection)                      |1                      |x*SCALE overflows u128             |
 |fp_sqrt Path A (Prop. 1)    |A/B |< 1 (Newton convergence arg.)                         |1                      |x*SCALE fits in u128               |
 |checked_mul_div_i (Lemma 3) |A   |0 (exact)                                             |0                      |returns Err on overflow            |
-|fp_div / fp_div_i (Lemma 2) |A   |exact floor (unsigned) / trunc (signed); remainder < 1 |1                     |b != 0, result not saturated       |
-|fp_mul_hp_u / _i / _fast (Prop. 2)|A|<= 0.5 (rounding)                                  |0                      |no overflow / no saturation        |
-|fp_div_hp_safe (Prop. 3)    |A   |exact trunc; remainder < 1                            |—                      |b != 0, \|r\|*S_HP fits i128 ‡    |
+|fp_div / fp_div_i (Lemma 2) |A   |exact floor (unsigned) / trunc (signed); remainder < 1 |1                     |b != 0, result fits                |
+|fp_mul_hp_u / _i / _fast (Prop. 2)|A|<= 0.5 (rounding)                                  |0                      |no overflow                        |
+|fp_div_hp_safe (Prop. 3)    |A   |exact trunc; remainder < 1                            |—                      |b != 0, returns Ok                 |
 |checked_mul_div_floor/ceil_i (Prop. 4)|A|0 (exact)                                       |0                      |returns Err on overflow            |
-|fp_div_floor / fp_div_ceil (Prop. 5)|A|0 (exact rounding)                                 |0-1                    |b != 0, result not saturated       |
+|fp_div_floor / fp_div_ceil (Prop. 5)|A|0 (exact rounding)                                 |0-1                    |b != 0, result fits                |
 |norm_cdf_poly (Prop. 6)     |B   |<= 9 (cert 2.27 + overhead 6)                          |4                      |\|x\| <= 8*SCALE                   |
 |ln_fixed_i (Prop. 7)        |B   |<= 3 (analytical, sub-ULP correction)                  |3                      |x > 0, result fits i128            |
 |exp_fixed_i (Prop. 8)       |B   |<= 4 * 2^k; rel < 5.7e-12                             |473M (boundary), 1 (financial)|\|x\| <= 40*SCALE            |
@@ -1554,14 +1554,13 @@ consistent with the attenuation effect dominating in practice.
 argument. B = analytical conservative bound (worst-case accumulation and/or Lipschitz
 certificate).
 
-‡ `fp_div_hp_safe` (Proposition 3) is exact only when the intermediate
-`|r| * SCALE_HP` does not overflow i128, which requires `|r| < 1.7e23` (i.e.
-`|b| < 1.7e23`). For typical HP-scale inputs this is always satisfied. If overflow
-occurs, the result saturates to `i128::MAX` or `i128::MIN` (sentinel, not a
-mathematical result).
+‡ `fp_div_hp_safe` (Proposition 3) uses a widened fallback when the intermediate
+`|r| * SCALE_HP` overflows i128. The result is exact for `Ok` values; unrepresentable
+quotients return `Err(Overflow)`.
 
-† The code accepts inputs up to ±40×SCALE (returning sentinel values beyond that
-range), but the error analysis in Proposition 8 covers only ±20×SCALE. The relative
+† The code accepts inputs up to ±40×SCALE, returns `Ok(0)` for underflow below
+that range, and returns `Err(Overflow)` above that range. The error analysis in
+Proposition 8 covers only ±20×SCALE. The relative
 error bound (< 1.7 × 10^-11) is valid for the full ±40×SCALE range; the absolute
 bound formula (12 × 2^k) is valid but gives much larger values at |x| > 20×SCALE.
 See Proposition 8 domain discrepancy remark.
@@ -1676,38 +1675,38 @@ formula) was unaffected, which is why cos_core passed immediately.
 ## Appendix: Out-of-domain behaviour
 
 This table documents what each function does when called with inputs outside its
-stated domain, based on source code inspection. **PANICS** means the function hits an
-assertion or unreachable path (transaction fails, no state change — safe). **SENTINEL**
-means it returns a special value (detectable by the caller). **CLAMPS** means the input
-is silently clamped to the valid range. **SILENT** means no guard exists and the function
-computes a meaningless or incorrect result without any indication of failure.
+stated proof domain, based on source code inspection. **ERR** means the function
+returns `Err(SolMathError::...)`. **UNDERFLOWS** means it returns zero because the
+mathematical value is below the fixed-point resolution. **CLAMPS** means the input
+or output is clamped to the documented boundary. **SILENT** means no guard exists
+and the function computes a meaningless or incorrect result without any indication
+of failure.
 
 |Function          |Domain per result                      |Out-of-domain behaviour                                                                                                                                                                                                                                                                                                                    |Safety           |
 |------------------|---------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------|
-|`fp_mul_i`        |result fits i128 (Lemma 1)             |**SATURATES** — `checked_mul` fast path + `checked_mul_div_i` widened fallback; saturates to `i128::MAX` or `i128::MIN`.                                                                                                                                                                                                                   |Safe             |
-|`ln_fixed_i`      |x > 0 (Prop. 7)                        |**SENTINEL** — returns `i128::MIN` for x = 0 (matches `ln_fixed_hp`). x < 0 impossible: parameter is u128.                                                                                                                                                                                                                                 |Safe             |
-|`exp_fixed_i`     |\|x\| ≤ 40×SCALE (code guard) (Prop. 8)|**SENTINEL** — returns 0 for x ≤ −40×SCALE, `i128::MAX / 4` for x ≥ 40×SCALE.                                                                                                                                                                                                                                                              |Safe             |
-|`pow_fixed_hp`    |base ∈ [0.01, 100]×S, exp ∈ [0, 20]×S (Prop. 11)|**SENTINEL** — returns 0 or saturates for out-of-range inputs (asserts replaced with sentinels). base = 0 returns 0 (correct). Negative base impossible (u128).                                                                                                                                                                            |Safe             |
+|`fp_mul_i`        |result fits i128 (Lemma 1)             |**ERR** — `checked_mul` fast path + `checked_mul_div_i` widened fallback; returns `Err(Overflow)` if the exact scaled result does not fit.                                                                                                                                                                                                 |Safe             |
+|`ln_fixed_i`      |x > 0 (Prop. 7)                        |**ERR** — returns `Err(DomainError)` for x = 0. x < 0 impossible: parameter is u128.                                                                                                                                                                                                                                                       |Safe             |
+|`exp_fixed_i`     |\|x\| < 40×SCALE (code guard) (Prop. 8)|**UNDERFLOWS/ERR** — returns `Ok(0)` for x ≤ −40×SCALE and `Err(Overflow)` for x ≥ 40×SCALE.                                                                                                                                                                                                                                             |Safe             |
+|`pow_fixed_hp`    |base ∈ [0.01, 100]×S, exp ∈ [0, 20]×S (Prop. 11)|**UNDERFLOWS/ERR** — returns exact special cases such as x^0 and 0^y, returns `Ok(0)` when the fixed-point result underflows, and returns `Err(Overflow)` when the result is too large. Negative base impossible (u128).                                                                                                                   |Safe             |
 |`sin_core`        |\|x\| ≤ π/4 × SCALE (Prop. 9a)         |**PANICS** (debug) / **SILENT** (release) — `debug_assert!` added; public `sin_fixed` performs octant reduction before calling.                                                                                                                                                                                                            |Mitigated (internal)|
 |`cos_core`        |\|x\| ≤ π/4 × SCALE (Prop. 9b)         |**PANICS** (debug) / **SILENT** (release) — identical to sin_core. Public `cos_fixed` performs range reduction.                                                                                                                                                                                                                            |Mitigated (internal)|
 |`norm_cdf_poly`   |\|x\| ≤ 8×SCALE (Prop. 6)              |**CLAMPS** — returns 0 for x < −8×SCALE, SCALE for x > 8×SCALE. Post-clamp on polynomial output to [0, SCALE].                                                                                                                                                                                                                             |Safe             |
 |`norm_cdf_poly_hp`|\|x\| ≤ 8×SCALE_HP (Prop. 10)          |**CLAMPS** — returns 0 for x < −8×SCALE_HP, SCALE_HP for x > 8×SCALE_HP. Post-clamp on polynomial output to [0, SCALE_HP].                                                                                                                                                                                                                 |Safe             |
-|`norm_pdf`        |\|x\| ≤ 8×SCALE (Prop. 12)             |**SILENT** (but functionally safe) — no explicit guard, but `exp_fixed_i(-x²/2)` triggers its own sentinel for large \|x\| (returns 0), so `norm_pdf` returns 0 in the tails. Mathematically correct behaviour despite the absence of an explicit check. The guarded wrapper `norm_cdf_and_pdf_bs_guarded` adds an explicit 8σ short-circuit.|Safe in practice |
-|`fp_div_hp_safe`  |\|r\|×SCALE_HP fits i128 (Prop. 3)      |**SATURATES** — `checked_mul_div_i` with sign-aware saturation to `i128::MAX` or `i128::MIN` on overflow.                                                                                                                                                                                                                                  |Safe              |
+|`norm_pdf`        |\|x\| ≤ 8×SCALE (Prop. 12)             |**UNDERFLOWS** — returns 0 in extreme tails after an explicit `-x²/2 < -40×SCALE` guard or unreachable `exp_fixed_i` overflow.                                                                                                                                                                                                             |Safe             |
+|`fp_div_hp_safe`  |scaled quotient fits i128 (Prop. 3)    |**ERR** — returns `Err(DivisionByZero)` for b = 0 and `Err(Overflow)` for unrepresentable quotients; uses U256 fallback for large remainder products.                                                                                                                                                                                       |Safe             |
 
 **Notes:**
 
-1. All functions are `pub(crate)` — none are publicly visible outside the crate.
-   `sin_core` and `cos_core` now have `debug_assert!` guards; in release mode,
+1. `sin_core` and `cos_core` are `pub(crate)` internals. They have `debug_assert!`
+   guards; in release mode,
    out-of-range inputs are still caught by the public wrappers (`sin_fixed`,
-   `cos_fixed`) which perform range reduction. `fp_div_hp_safe` now saturates on
-   overflow rather than producing silently incorrect results. `fp_mul_i` now handles
-   overflow via a widened fallback rather than panicking or wrapping. `ln_fixed_i`
-   and `pow_fixed_hp` return sentinels rather than panicking on edge-case inputs.
-   The error bounds in this document apply to the internal kernels on their stated
-   domains.
-1. No functions in the library panic on any input in release mode. All out-of-domain
-   behaviour is either sentinel returns, saturation, or clamping.
+   `cos_fixed`) which perform range reduction. `fp_div_hp_safe` uses widened
+   arithmetic instead of producing silently incorrect results. `fp_mul_i` handles
+   overflow via a widened fallback and returns `Err(Overflow)` if the final result
+   does not fit. The error bounds in this document apply to the internal kernels
+   on their stated domains.
+1. No production public function is expected to panic on supported release builds.
+   Out-of-domain behaviour is documented as `Err`, underflow-to-zero, or clamping.
 
 -----
 
@@ -1813,58 +1812,62 @@ relevant input separation, the true CDF increment dominates the error variation.
 
 ## Appendix: Compute unit budget (Solana)
 
-CU measurements from production benchmark suite (100K stratified vectors per function,
-preliminary CU sample — full 50K-per-function CU run pending). All values in Solana
+CU measurements from Solana localnet production benchmark runs. Most medians come
+from 50,000 on-chain vectors per function (`BENCH_CONCURRENCY=32`); avg/max values
+come from the current benchmark tables where available. All values are Solana
 compute units.
 
 ### Individual function CU cost
 
-|Function         |Avg CU |Min CU |Max CU     |Notes                                                      |
-|-----------------|-------|-------|-----------|-----------------------------------------------------------|
-|fp_div / fp_div_i|742–767|129–142|1,863–1,896|Three-path dispatch; wide path is costly                   |
-|checked_mul_div_i|1,786  |610    |4,646      |U256 path when product overflows u128                      |
-|fp_sqrt          |3,205  |1,276  |8,119      |Thin path vs overflow path                                 |
-|fp_mul_hp_i      |1,821  |1,388  |1,875      |Very consistent (schoolbook decomposition)                 |
-|ln_fixed_i       |7,137  |7,137  |7,137      |Preliminary (1 vector)                                     |
-|ln_fixed_hp      |9,607  |3,397  |13,052     |~1.5× standard due to HP multiplications                   |
-|sin_fixed        |2,070  |1,793  |2,305      |Includes range reduction                                   |
-|cos_fixed        |2,054  |1,710  |2,301      |Includes range reduction                                   |
-|norm_cdf_poly    |6,148  |5,158  |7,151      |Varies by piece (degree-11 Horner)                         |
-|norm_cdf_poly_hp |25,470 |365    |40,974     |High variance: short-circuit vs degree-17                  |
-|pow_fixed_hp     |22,068 |7,614  |29,677     |Short-circuit for special cases; ln→mul→exp chain otherwise|
+|Function         |Avg CU |Median CU|Max CU |Notes                                      |
+|-----------------|-------|---------|-------|-------------------------------------------|
+|fp_div           |625    |655      |690    |Current NUC arithmetic rerun               |
+|fp_div_i         |652    |676      |724    |Current NUC arithmetic rerun               |
+|checked_mul_div_i|883    |883      |3,807  |U256 path when product overflows u128      |
+|fp_sqrt          |3,598  |3,007    |9,402  |Thin path vs overflow path                 |
+|fp_mul_hp_i      |103    |103      |103    |Current optimized HP multiply              |
+|ln_fixed_i       |4,562  |4,362    |5,207  |Table-assisted Remez                       |
+|ln_fixed_hp      |19,175 |18,889   |19,764 |Compensated HP path                        |
+|sin_fixed        |4,654  |4,029    |5,170  |Includes range reduction                   |
+|cos_fixed        |4,578  |4,027    |5,181  |Includes range reduction                   |
+|norm_cdf_poly    |6,844  |6,186    |15,333 |Varies by piece and tail path              |
+|norm_cdf_poly_hp |24,234 |19,708   |40,691 |High variance: short-circuit vs polynomial |
+|pow_fixed_hp     |27,408 |27,408   |35,000 |ln -> mul -> exp chain                     |
 
 ### Composite workflow CU cost
 
-|Workflow              |Avg CU |Min CU |Max CU |
-|----------------------|-------|-------|-------|
-|**bs_full (standard)**|56,719 |24,208 |66,657 |
-|**bs_full_hp (HP)**   |117,228|49,046 |165,947|
-|bs_full.vega          |36,326 |9,317  |52,674 |
-|pow_hp                |22,068 |7,614  |29,677 |
-|pow_product_hp        |37,138 |16,714 |46,486 |
-|nig_64                |302,197|242,099|326,909|
-|implied_vol           |129,083|16,301 |196,621|
+|Workflow / function       |Avg CU |Median CU|Max CU |
+|--------------------------|-------|---------|-------|
+|**bs_full (standard)**    |50,191 |50,015   |68,418 |
+|**bs_full_hp (HP)**       |118,202|116,628  |164,961|
+|barrier_option            |262,906|261,773  |385,456|
+|pow_product_hp            |16,000 |—        |20,000 |
+|nig_64                    |344,273|346,648  |386,010|
+|implied_vol               |156,563|148,575  |395,940|
+|bvn_cdf                   |128,614|129,700  |153,090|
+|Phi2Table.eval            |943    |943      |943    |
 
 ### Budget assessment
 
-**Standard Black-Scholes (bs_full):** 67K CU worst case — fits comfortably within
+**Standard Black-Scholes (bs_full):** 68K CU worst case — fits comfortably within
 the default 200K CU transaction budget. Leaves ample room for surrounding program
 logic (account deserialization, state updates, CPI calls).
 
-**HP Black-Scholes (bs_full_hp):** 166K CU worst case — fits within 200K CU but
-with limited headroom (~34K CU remaining). For transactions that require additional
+**HP Black-Scholes (bs_full_hp):** 165K CU worst case in the benchmark set — fits
+within 200K CU but with limited headroom (~35K CU remaining). For transactions that require additional
 computation beyond pricing (e.g., settlement logic, multi-leg evaluation), a CU
 budget increase to 400K should be requested. This is standard practice on Solana and
 has minimal gas cost impact.
 
-**NIG model (nig_64):** 327K CU worst case — requires a CU budget increase and
+**NIG model (nig_64):** 386K CU worst case — requires a CU budget increase and
 may need architectural consideration (e.g., splitting across instructions) if
 combined with other computation.
 
-**Implied volatility (implied_vol):** 197K CU worst case — fits within 200K CU
-but with essentially no headroom. Iterative solvers are inherently variable; the
-minimum (16K) reflects fast convergence while the maximum reflects edge cases. A
-CU budget increase is recommended for production use.
+**Implied volatility (implied_vol):** 396K CU worst case — requires a CU budget
+increase. Iterative solvers are inherently variable; fast convergence is much
+cheaper while edge cases can approach the upper bound.
+
+**Barrier options:** 385K CU worst case — require a CU budget increase.
 
 -----
 
@@ -1939,7 +1942,7 @@ chain. Median SF of 11.1–11.2 for call/put is adequate for many applications b
 leaves less headroom. The adversarial suite shows 6K max for calls, 5K for puts.
 
 **Recommendation:** Use `bs_full_hp` for all pricing paths where accuracy matters.
-The CU cost premium (126K vs 44K) is justified by the 3+ orders of magnitude
+The CU cost premium (118K vs 50K average) is justified by the 3+ orders of magnitude
 improvement in accuracy. Reserve `bs_full` for gas-constrained paths where
 approximate pricing is acceptable (e.g., indicative quotes, UI display values).
 

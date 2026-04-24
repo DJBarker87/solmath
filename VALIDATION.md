@@ -6,19 +6,20 @@ published crate stays usable while the full audit trail remains reproducible.
 
 ## Toolchains
 
-The `0.1.4` release was checked with:
+The `0.1.5` release was checked with:
 
 - Rust/Cargo release toolchain: `rustc 1.93.0`, `cargo 1.93.0`
 - MSRV library check: `rustc 1.79.0`
 - Package metadata: `rust-version = "1.79"`
 
-The test suite uses dev-dependencies such as `proptest`; run the full tests on
-stable. The MSRV job intentionally checks the library surface only:
+The crate has no runtime or dev dependencies. Run the full tests on stable.
+The MSRV job intentionally checks the library surface only:
 `cargo +1.79.0 check --lib --all-features`.
 
-## CI
+## Release Checks
 
-GitHub Actions runs `.github/workflows/ci.yml` on push and pull requests:
+Run this sequence locally before publishing. It is also the expected CI
+sequence if a workflow is added:
 
 ```bash
 cargo check --lib --all-features       # Rust 1.79.0 MSRV library check
@@ -49,8 +50,8 @@ Then verify the generated package, not only the working tree:
 ```bash
 rm -rf /tmp/solmath-package
 mkdir -p /tmp/solmath-package
-tar -xzf target/package/solmath-0.1.4.crate -C /tmp/solmath-package
-cd /tmp/solmath-package/solmath-0.1.4
+tar -xzf target/package/solmath-0.1.5.crate -C /tmp/solmath-package
+cd /tmp/solmath-package/solmath-0.1.5
 cargo test --all-features
 ```
 
@@ -58,7 +59,8 @@ cargo test --all-features
 
 Included in the crates.io package:
 
-- `benchmark/iv_vectors.json` — implied-vol recovery regression vectors.
+- `benchmark/iv_vectors.json` — compact implied-vol recovery regression vectors.
+- `INTEGRATION.md` — copy-paste Solana integration patterns.
 - `test_data/heston_reference_tests.rs` — generated Heston reference tests.
 - `test_data/sabr_reference_tests.rs` — generated SABR reference tests.
 - `PROOFS.md` — analytical error-bound notes for core approximations.
@@ -69,14 +71,8 @@ Repository-only assets:
 - `tests/reference/mul_div_vectors.json` — large generated mul-div corpus.
 
 The repository-only assets are excluded from the crate tarball to keep install
-and docs.rs builds small. CI and the crate test suite still cover mul-div using
-exact edge vectors plus property tests.
-
-From a full repository checkout, run the large mul-div corpus explicitly:
-
-```bash
-SOLMATH_FULL_VECTORS=1 cargo test --all-features validate_against_full_python_vectors_when_requested
-```
+and docs.rs builds small. The crate test suite still covers mul-div using exact
+edge vectors plus deterministic property-style sweeps.
 
 To regenerate the larger offline assets from a full repository checkout:
 
@@ -94,12 +90,12 @@ python3 scripts/crosscheck_quantlib.py
 
 | Area | Status | Use today? | Notes |
 |------|--------|------------|-------|
-| Core fixed-point arithmetic | Internally tested, property-tested | Yes, with protocol review | Overflow returns `Err`, no silent wrapping. |
+| Core fixed-point arithmetic | Internally tested, deterministic property-style sweeps | Yes, with protocol review | Overflow returns `Err`, no silent wrapping. |
 | Token conversion helpers | Internally tested | Yes, with explicit floor/ceil policy | Use floor for payouts and ceil for collections. |
 | Weighted pool math | Internally tested | Candidate | Validate economic invariants for your pool parameters. |
 | HP Black-Scholes | QuantLib cross-checked | Candidate | Best-supported pricing path; still unaudited. |
 | Standard Black-Scholes | Internally tested | Candidate | Lower precision than HP path. |
-| Implied volatility | Vector-tested | Caution | Solver returns `NoConvergence`; callers need fallback policy. |
+| Implied volatility | Roundtrip-tested; offline-vector measured | Caution | Solver returns `NoConvergence`; callers need fallback policy. |
 | Barrier options | QuantLib cross-checked | Caution | Requires higher compute budget. |
 | Heston, SABR, NIG | Reference-tested | Research/caution | Model risk dominates arithmetic risk; validate assumptions independently. |
 | Bivariate CDF/table lookup | mpmath-vector tested | Research/caution | Accuracy degrades near extreme correlations; see README notes. |

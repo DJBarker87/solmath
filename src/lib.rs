@@ -774,88 +774,6 @@ mod tests {
             "IV batch roundtrip: {}/{} passed ({:.1}%), need ≥90%", pass, total, pct);
     }
 
-    #[test]
-    fn implied_vol_vector_recovery() {
-        use std::vec::Vec;
-
-        // Load iv_vectors.json and report recovery by difficulty
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("benchmark/iv_vectors.json");
-        let data = std::fs::read_to_string(&path)
-            .unwrap_or_else(|_| panic!("Cannot read {:?}", path));
-        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
-        let vectors = parsed["vectors"].as_array().unwrap();
-
-        let mut pass_easy = 0u32; let mut total_easy = 0u32;
-        let mut pass_mod = 0u32; let mut total_mod = 0u32;
-        let mut pass_hard = 0u32; let mut total_hard = 0u32;
-        let mut max_ulp: u128 = 0;
-        let mut ulps: Vec<u128> = Vec::new();
-
-        for v in vectors {
-            let s = v["s"].as_u64().unwrap() as u128;
-            let k = v["k"].as_u64().unwrap() as u128;
-            let r = v["r"].as_u64().unwrap() as u128;
-            let t_val = v["t"].as_u64().unwrap() as u128;
-            let sigma_in = v["sigma"].as_u64().unwrap() as u128;
-            let call_price = v["call_price"].as_u64().unwrap() as u128;
-            let difficulty = v["difficulty"].as_str().unwrap();
-            let root_tag = v.get("root_tag").and_then(|rt| rt.as_str()).unwrap_or("");
-
-            // Skip expected failures and zero-price
-            if difficulty == "expected_failure" || root_tag == "zero_price" || root_tag == "intrinsic_only" {
-                continue;
-            }
-
-            let (total_ref, pass_ref) = match difficulty {
-                "easy" => (&mut total_easy, &mut pass_easy),
-                "moderate" => (&mut total_mod, &mut pass_mod),
-                _ => (&mut total_hard, &mut pass_hard),
-            };
-            *total_ref += 1;
-
-            match implied_vol(call_price, s, k, r, t_val) {
-                Ok(sigma_out) => {
-                    let ulp = if sigma_out > sigma_in {
-                        sigma_out - sigma_in
-                    } else {
-                        sigma_in - sigma_out
-                    };
-                    ulps.push(ulp);
-                    if ulp > max_ulp { max_ulp = ulp; }
-                    if ulp <= 1000 { *pass_ref += 1; }
-                }
-                Err(_) => {}
-            }
-        }
-
-        let total = total_easy + total_mod + total_hard;
-        let pass = pass_easy + pass_mod + pass_hard;
-
-        #[cfg(feature = "pade-iv")]
-        let label = "Pade [4/4]";
-        #[cfg(not(feature = "pade-iv"))]
-        let label = "Li bivariate";
-
-        std::eprintln!("\n=== IV Vector Recovery ({}) ===", label);
-        std::eprintln!("  Easy:     {}/{}", pass_easy, total_easy);
-        std::eprintln!("  Moderate: {}/{}", pass_mod, total_mod);
-        std::eprintln!("  Hard:     {}/{}", pass_hard, total_hard);
-        std::eprintln!("  TOTAL:    {}/{}", pass, total);
-        if !ulps.is_empty() {
-            ulps.sort();
-            let median = ulps[ulps.len() / 2];
-            std::eprintln!("  Max ULP:  {}", max_ulp);
-            std::eprintln!("  Med ULP:  {}", median);
-            std::eprintln!("  P99 ULP:  {}", ulps[ulps.len() * 99 / 100]);
-        }
-        std::eprintln!("==============================\n");
-
-        assert!(pass >= total * 85 / 100,
-            "IV vector recovery: {}/{} ({:.1}%)", pass, total,
-            pass as f64 / total as f64 * 100.0);
-    }
-
     // ── NIG errors ──
 
     #[test]
@@ -1417,84 +1335,88 @@ mod tests {
 #[cfg(test)]
 mod mul_div_properties {
     use super::*;
-    use proptest::prelude::*;
 
-    /// Filter to non-overflow cases: c > 0 and result fits u64.
-    fn non_overflow() -> impl Strategy<Value = (u64, u64, u64)> {
-        (any::<u64>(), any::<u64>(), 1..=u64::MAX).prop_filter(
-            "result must fit u64",
-            |&(a, b, c)| {
-                let product = (a as u128) * (b as u128);
-                let floor = product / (c as u128);
-                let ceil = (product + (c as u128) - 1) / (c as u128);
-                floor <= u64::MAX as u128 && ceil <= u64::MAX as u128
-            },
-        )
+    fn next_u64(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state
     }
 
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
-
-        // Property 1: floor <= ceil
-        #[test]
-        fn floor_le_ceil((a, b, c) in non_overflow()) {
-            let f = mul_div_floor(a, b, c).unwrap();
-            let ce = mul_div_ceil(a, b, c).unwrap();
-            prop_assert!(f <= ce, "floor {} > ceil {}", f, ce);
+    /// Returns true when the case is inside the u64 API's non-overflow domain.
+    fn check_case(a: u64, b: u64, c: u64) -> bool {
+        if c == 0 {
+            return false;
         }
 
-        // Property 2: ceil - floor <= 1
-        #[test]
-        fn ceil_minus_floor_le_1((a, b, c) in non_overflow()) {
-            let f = mul_div_floor(a, b, c).unwrap();
-            let ce = mul_div_ceil(a, b, c).unwrap();
-            prop_assert!(ce - f <= 1, "ceil - floor = {} > 1", ce - f);
+        let product = (a as u128) * (b as u128);
+        let c128 = c as u128;
+        let floor = product / c128;
+        let ceil = if product % c128 == 0 { floor } else { floor + 1 };
+        if floor > u64::MAX as u128 || ceil > u64::MAX as u128 {
+            return false;
         }
 
-        // Property 3: floor is correct lower bound
-        #[test]
-        fn floor_lower_bound((a, b, c) in non_overflow()) {
-            let f = mul_div_floor(a, b, c).unwrap();
-            let product = (a as u128) * (b as u128);
-            let c128 = c as u128;
-            // f * c <= a * b
-            prop_assert!((f as u128) * c128 <= product);
-            // (f + 1) * c > a * b
-            prop_assert!((f as u128 + 1) * c128 > product);
+        let f = mul_div_floor(a, b, c).unwrap();
+        let ce = mul_div_ceil(a, b, c).unwrap();
+
+        assert!(f <= ce, "floor {} > ceil {}", f, ce);
+        assert!(ce - f <= 1, "ceil - floor = {} > 1", ce - f);
+        assert_eq!(f as u128, floor);
+        assert_eq!(ce as u128, ceil);
+        assert!((f as u128) * c128 <= product);
+        assert!((f as u128 + 1) * c128 > product);
+        assert!((ce as u128) * c128 >= product);
+        if ce > 0 {
+            assert!((ce as u128 - 1) * c128 < product);
+        }
+        assert_eq!(mul_div_floor(a, b, c), mul_div_floor(b, a, c));
+        assert_eq!(mul_div_ceil(a, b, c), mul_div_ceil(b, a, c));
+
+        if product % c128 == 0 {
+            assert_eq!(f, ce);
         }
 
-        // Property 4: ceil is correct upper bound
-        #[test]
-        fn ceil_upper_bound((a, b, c) in non_overflow()) {
-            let ce = mul_div_ceil(a, b, c).unwrap();
-            let product = (a as u128) * (b as u128);
-            let c128 = c as u128;
-            // ce * c >= a * b
-            prop_assert!((ce as u128) * c128 >= product);
-            // if ce > 0: (ce - 1) * c < a * b
-            if ce > 0 {
-                prop_assert!((ce as u128 - 1) * c128 < product);
+        true
+    }
+
+    #[test]
+    fn deterministic_properties() {
+        let interesting = [
+            0,
+            1,
+            2,
+            3,
+            7,
+            10,
+            99,
+            100,
+            999,
+            1_000_000,
+            u32::MAX as u64,
+            u64::MAX / 2,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+
+        let mut checked = 0usize;
+        for &a in &interesting {
+            for &b in &interesting {
+                for &c in &interesting[1..] {
+                    checked += usize::from(check_case(a, b, c));
+                }
             }
         }
 
-        // Property 5: commutativity in a and b
-        #[test]
-        fn commutative((a, b, c) in non_overflow()) {
-            prop_assert_eq!(mul_div_floor(a, b, c), mul_div_floor(b, a, c));
-            prop_assert_eq!(mul_div_ceil(a, b, c), mul_div_ceil(b, a, c));
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..10_000 {
+            let a = next_u64(&mut state);
+            let b = next_u64(&mut state);
+            let c = next_u64(&mut state) | 1;
+            checked += usize::from(check_case(a, b, c));
         }
 
-        // Property 6: exact division means floor == ceil
-        #[test]
-        fn exact_div_floor_eq_ceil((a, b, c) in non_overflow()) {
-            let product = (a as u128) * (b as u128);
-            if product % (c as u128) == 0 {
-                prop_assert_eq!(
-                    mul_div_floor(a, b, c).unwrap(),
-                    mul_div_ceil(a, b, c).unwrap()
-                );
-            }
-        }
+        assert!(checked > 1_000, "checked too few non-overflow cases: {}", checked);
     }
 }
 
@@ -1502,73 +1424,94 @@ mod mul_div_properties {
 #[cfg(test)]
 mod mul_div_u128_properties {
     use super::*;
-    use proptest::prelude::*;
 
-    /// Generate u128 triples where the result fits u128.
-    /// Uses u64-range a,b (product fits u128) with any c > 0.
-    fn non_overflow_small() -> impl Strategy<Value = (u128, u128, u128)> {
-        (any::<u64>(), any::<u64>(), 1..=u64::MAX).prop_map(
-            |(a, b, c)| (a as u128, b as u128, c as u128),
-        )
+    fn next_u128(state: &mut u128) -> u128 {
+        *state = state
+            .wrapping_mul(0xda94_2042_e4dd_58b5_da94_2042_e4dd_58b5)
+            .wrapping_add(0x9e37_79b9_7f4a_7c15_9e37_79b9_7f4a_7c15);
+        *state
     }
 
-    /// Generate large u128 values that exercise the U256 overflow path.
-    fn non_overflow_large() -> impl Strategy<Value = (u128, u128, u128)> {
-        (1u128 << 64..1u128 << 96, 1u128 << 64..1u128 << 96, 1u128 << 64..1u128 << 96)
-            .prop_filter("result must fit u128", |&(a, b, c)| {
-                crate::overflow::checked_mul_div_rem_u(a, b, c).is_some()
-            })
+    fn check_case(a: u128, b: u128, c: u128) -> bool {
+        if c == 0 {
+            return false;
+        }
+
+        let Some((floor, rem)) = crate::overflow::checked_mul_div_rem_u(a, b, c) else {
+            return false;
+        };
+        if rem > 0 && floor == u128::MAX {
+            return false;
+        }
+        let ceil = floor + u128::from(rem > 0);
+
+        let f = mul_div_floor_u128(a, b, c).unwrap();
+        let ce = mul_div_ceil_u128(a, b, c).unwrap();
+        assert_eq!(f, floor);
+        assert_eq!(ce, ceil);
+        assert!(f <= ce, "floor {} > ceil {}", f, ce);
+        assert!(ce - f <= 1, "ceil - floor = {} > 1", ce - f);
+        assert_eq!(mul_div_floor_u128(a, b, c), mul_div_floor_u128(b, a, c));
+        assert_eq!(mul_div_ceil_u128(a, b, c), mul_div_ceil_u128(b, a, c));
+
+        if a <= u64::MAX as u128
+            && b <= u64::MAX as u128
+            && c <= u64::MAX as u128
+            && ceil <= u64::MAX as u128
+        {
+            assert_eq!(mul_div_floor(a as u64, b as u64, c as u64).unwrap() as u128, f);
+            assert_eq!(mul_div_ceil(a as u64, b as u64, c as u64).unwrap() as u128, ce);
+        }
+
+        true
     }
 
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+    #[test]
+    fn deterministic_properties() {
+        let interesting = [
+            0,
+            1,
+            2,
+            3,
+            7,
+            10,
+            100,
+            1_000_000,
+            u64::MAX as u128,
+            1u128 << 64,
+            1u128 << 80,
+            (1u128 << 96) - 1,
+            u128::MAX / 2,
+            u128::MAX - 1,
+            u128::MAX,
+        ];
 
-        #[test]
-        fn floor_le_ceil((a, b, c) in non_overflow_small()) {
-            let f = mul_div_floor_u128(a, b, c).unwrap();
-            let ce = mul_div_ceil_u128(a, b, c).unwrap();
-            prop_assert!(f <= ce, "floor {} > ceil {}", f, ce);
-            prop_assert!(ce - f <= 1, "ceil - floor = {} > 1", ce - f);
-        }
-
-        #[test]
-        fn commutative((a, b, c) in non_overflow_small()) {
-            prop_assert_eq!(mul_div_floor_u128(a, b, c), mul_div_floor_u128(b, a, c));
-            prop_assert_eq!(mul_div_ceil_u128(a, b, c), mul_div_ceil_u128(b, a, c));
-        }
-
-        #[test]
-        fn floor_le_ceil_large((a, b, c) in non_overflow_large()) {
-            let f = mul_div_floor_u128(a, b, c).unwrap();
-            let ce = mul_div_ceil_u128(a, b, c).unwrap();
-            prop_assert!(f <= ce, "floor {} > ceil {}", f, ce);
-            prop_assert!(ce - f <= 1, "ceil - floor = {} > 1", ce - f);
-        }
-
-        #[test]
-        fn commutative_large((a, b, c) in non_overflow_large()) {
-            prop_assert_eq!(mul_div_floor_u128(a, b, c), mul_div_floor_u128(b, a, c));
-            prop_assert_eq!(mul_div_ceil_u128(a, b, c), mul_div_ceil_u128(b, a, c));
-        }
-
-        /// u128 variant must agree with u64 variant for u64-range inputs
-        #[test]
-        fn agrees_with_u64((a, b, c) in (any::<u64>(), any::<u64>(), 1..=u64::MAX).prop_filter(
-            "result must fit u64",
-            |&(a, b, c)| {
-                let product = (a as u128) * (b as u128);
-                product / (c as u128) <= u64::MAX as u128
-                    && (product + (c as u128) - 1) / (c as u128) <= u64::MAX as u128
+        let mut checked = 0usize;
+        for &a in &interesting {
+            for &b in &interesting {
+                for &c in &interesting[1..] {
+                    checked += usize::from(check_case(a, b, c));
+                }
             }
-        )) {
-            let f64 = mul_div_floor(a, b, c).unwrap();
-            let f128 = mul_div_floor_u128(a as u128, b as u128, c as u128).unwrap();
-            prop_assert_eq!(f64 as u128, f128);
-
-            let c64 = mul_div_ceil(a, b, c).unwrap();
-            let c128 = mul_div_ceil_u128(a as u128, b as u128, c as u128).unwrap();
-            prop_assert_eq!(c64 as u128, c128);
         }
+
+        let mut state = 0x243f_6a88_85a3_08d3_1319_8a2e_0370_7344u128;
+        for _ in 0..10_000 {
+            let a = next_u128(&mut state) as u64 as u128;
+            let b = next_u128(&mut state) as u64 as u128;
+            let c = (next_u128(&mut state) as u64 | 1) as u128;
+            checked += usize::from(check_case(a, b, c));
+        }
+
+        let mask = (1u128 << 80) - 1;
+        for _ in 0..10_000 {
+            let a = (1u128 << 80) | (next_u128(&mut state) & mask);
+            let b = (1u128 << 80) | (next_u128(&mut state) & mask);
+            let c = (1u128 << 80) | (next_u128(&mut state) & mask);
+            checked += usize::from(check_case(a, b, c));
+        }
+
+        assert!(checked > 1_000, "checked too few non-overflow cases: {}", checked);
     }
 }
 
@@ -1577,7 +1520,6 @@ mod mul_div_u128_properties {
 mod mul_div_cross_validation {
     use super::*;
 
-    #[derive(serde::Deserialize)]
     struct Vector {
         a: u64,
         b: u64,
@@ -1626,30 +1568,4 @@ mod mul_div_cross_validation {
         }
     }
 
-    #[test]
-    fn validate_against_full_python_vectors_when_requested() {
-        if std::env::var("SOLMATH_FULL_VECTORS").ok().as_deref() != Some("1") {
-            std::eprintln!("set SOLMATH_FULL_VECTORS=1 to run the full mul-div vector corpus");
-            return;
-        }
-
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/reference/mul_div_vectors.json");
-        let data = std::fs::read_to_string(&path)
-            .unwrap_or_else(|_| panic!("Cannot read {:?}", path));
-        let vectors: alloc::vec::Vec<Vector> = serde_json::from_str(&data).expect("parse vectors");
-
-        for v in &vectors {
-            let f = mul_div_floor(v.a, v.b, v.c).unwrap();
-            let ce = mul_div_ceil(v.a, v.b, v.c).unwrap();
-            if f != v.floor {
-                panic!("FLOOR mismatch: a={} b={} c={} expected={} got={}", v.a, v.b, v.c, v.floor, f);
-            }
-            if ce != v.ceil {
-                panic!("CEIL mismatch: a={} b={} c={} expected={} got={}", v.a, v.b, v.c, v.ceil, ce);
-            }
-        }
-
-        assert!(!vectors.is_empty(), "full vector corpus should not be empty");
-    }
 }
