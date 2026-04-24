@@ -148,7 +148,8 @@ solmath/src/
 ├── i64_math.rs       i64-scale NIG for on-chain use
 ├── i64_cf.rs         i64-scale Heston characteristic function
 ├── pool.rs           Weighted pool swap + token conversion
-├── gamma.rs          Regularised incomplete gamma (for IL premium)
+├── bvn_cdf.rs        Bivariate normal CDF
+├── phi2table.rs      Offline Φ₂ lookup-table generation
 └── lib.rs            Feature-gated re-exports
 ```
 
@@ -186,6 +187,12 @@ sabr
 
 pool
   pool — requires transcendental (uses pow_fixed_hp)
+
+bivariate
+  bvn_cdf — requires transcendental
+
+table-gen
+  phi2table — requires bivariate
 ```
 
 Default features: `transcendental + complex`. Use `features = ["full"]`

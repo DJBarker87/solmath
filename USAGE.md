@@ -3,8 +3,8 @@
 Worked examples for every major feature. All code compiles standalone with
 `solmath = { version = "0.1", features = ["full"] }`.
 
-See [docs/API_REFERENCE.md](docs/API_REFERENCE.md) for the complete function
-listing with signatures, CU costs, and ULP accuracy.
+See the generated rustdoc API and the function table in `README.md` for
+complete signatures, CU costs, and ULP accuracy.
 
 ---
 

@@ -1,6 +1,6 @@
 [package]
 name = "solmath"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Fixed-point financial math for Solana. Black-Scholes, Greeks, IV, NIG pricing, pool math — pure integer arithmetic, no_std, zero dependencies."
 license = "MIT OR Apache-2.0"
@@ -11,8 +11,17 @@ readme = "README.md"
 include = [
     "Cargo.toml",
     "README.md",
+    "SECURITY.md",
+    "USAGE.md",
+    "PROOFS.md",
     "LICENSE-APACHE",
     "LICENSE-MIT",
+    "docs/**",
+    "scripts/**",
+    "benchmark/iv_vectors.json",
+    "test_data/heston_reference_tests.rs",
+    "test_data/sabr_reference_tests.rs",
+    "tests/reference/mul_div_vectors.json",
     "src/**",
 ]
 

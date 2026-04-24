@@ -44,7 +44,7 @@ let r = 50_000_000_000u128;             // risk-free rate = 5%
 let sigma = 200_000_000_000u128;        // volatility = 20%
 let t = SCALE;                          // time to expiry = 1 year
 
-let greeks = bs_full_hp(s, k, r, sigma, t);
+let greeks = bs_full_hp(s, k, r, sigma, t)?;
 // greeks.call  ≈ $8.02
 // greeks.gamma ≈ 0.0198
 // greeks.vega  ≈ 39.67
@@ -424,18 +424,18 @@ pow_int(base: u128, n: u128) -> Result<u128, SolMathError> // integer power, spl
 pow_fixed_i(base: i128, exp: i128) -> Result<i128, SolMathError> // signed power
 ln_fixed_hp(x: i128) -> Result<i128, SolMathError>   // HP variant, 2 ULP max, ~19K CU (compensated DW)
 exp_fixed_hp(x: i128) -> Result<i128, SolMathError>   // HP variant at 1e15 scale
-sin_fixed(x: i128) -> i128               // 2 ULP max, ~5K CU
-cos_fixed(x: i128) -> i128               // 2 ULP max, ~5K CU
-sincos_fixed(x: i128) -> (i128, i128)    // both at once, shared reduction
+sin_fixed(x: i128) -> Result<i128, SolMathError>                // 2 ULP max, ~5K CU
+cos_fixed(x: i128) -> Result<i128, SolMathError>                // 2 ULP max, ~5K CU
+sincos_fixed(x: i128) -> Result<(i128, i128), SolMathError>     // both at once, shared reduction
 ```
 
 ### Normal Distribution
 
 ```rust
-norm_cdf_poly(x: i128) -> i128            // Phi(x), piecewise minimax, ~7K CU, 4 ULP
-norm_pdf(x: i128) -> i128                 // phi(x) = exp(-x^2/2)/sqrt(2pi), 2 ULP
-norm_cdf_and_pdf(x) -> (i128, i128)       // both at once
-norm_cdf_poly_hp(x: i128) -> i128         // HP variant, 5 ULP at 1e15 scale, ~24K CU
+norm_cdf_poly(x: i128) -> Result<i128, SolMathError>            // Phi(x), piecewise minimax, ~7K CU, 4 ULP
+norm_pdf(x: i128) -> Result<i128, SolMathError>                 // phi(x) = exp(-x^2/2)/sqrt(2pi), 2 ULP
+norm_cdf_and_pdf(x: i128) -> Result<(i128, i128), SolMathError> // both at once
+norm_cdf_poly_hp(x: i128) -> Result<i128, SolMathError>         // HP variant, 5 ULP at 1e15 scale, ~24K CU
 ```
 
 ### Arithmetic
@@ -458,9 +458,9 @@ mul_div_floor(a: u64, b: u64, c: u64) -> Result<u64, SolMathError> // u64 mul-di
 mul_div_ceil(a: u64, b: u64, c: u64) -> Result<u64, SolMathError>  // u64 mul-div, ceil
 mul_div_floor_u128(a: u128, b: u128, c: u128) -> Result<u128, SolMathError> // u128 mul-div via U256
 mul_div_ceil_u128(a: u128, b: u128, c: u128) -> Result<u128, SolMathError>  // u128 mul-div via U256
-fp_sqrt(x: u128) -> u128                   // Newton-Raphson, 1 ULP
-fp_mul_hp_i(a: i128, b: i128) -> i128      // HP multiply at 1e15 scale
-fp_mul_hp_u(a: u128, b: u128) -> u128      // HP multiply unsigned
+fp_sqrt(x: u128) -> Result<u128, SolMathError>       // Newton-Raphson, 1 ULP
+fp_mul_hp_i(a: i128, b: i128) -> Result<i128, SolMathError> // HP multiply at 1e15 scale
+fp_mul_hp_u(a: u128, b: u128) -> Result<u128, SolMathError> // HP multiply unsigned
 fp_div_hp_safe(a: i128, b: i128) -> Result<i128, SolMathError> // HP division
 ```
 
@@ -490,15 +490,15 @@ weighted_pool_swap(
 ) -> Result<(u128, u128), SolMathError>  // (net_output, fee)
 
 pow_product_hp(x, w) -> Result<u128, SolMathError> // x^w * x^(1-w) pool invariant, 13+ sig figs
-token_to_fp(raw_amount: u64, decimals: u8) -> u128
-fp_to_token_floor(fp_amount: u128, decimals: u8) -> u64
-fp_to_token_ceil(fp_amount: u128, decimals: u8) -> u64
+token_to_fp(raw_amount: u64, decimals: u8) -> Result<u128, SolMathError>
+fp_to_token_floor(fp_amount: u128, decimals: u8) -> Result<u64, SolMathError>
+fp_to_token_ceil(fp_amount: u128, decimals: u8) -> Result<u64, SolMathError>
 ```
 
 ### Complex Arithmetic
 
 ```rust
-complex_mul(a: Complex, b: Complex) -> Complex
+complex_mul(a: Complex, b: Complex) -> Result<Complex, SolMathError>
 complex_div(a: Complex, b: Complex) -> Result<Complex, SolMathError>
 complex_exp(z: Complex) -> Result<Complex, SolMathError>
 complex_sqrt(z: Complex) -> Result<Complex, SolMathError>

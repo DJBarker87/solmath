@@ -142,9 +142,8 @@ than looping forever.
 
 ## Audit history
 
-| Date | Scope | Findings | Resolution |
-|------|-------|----------|------------|
-| 2024 (internal red-team) | arithmetic, pow, IV, complex, DoubleWord | 12 findings | All fixed in `7b63ff7` |
-| 2024 (follow-up audit) | overflow safety in pow_fixed_i, fp_mul_i_round, IV, complex_mul6 | 5 findings | All fixed in `c926a8a` |
-
-For the full list of changes, see `git log --oneline`.
+No independent third-party audit is claimed for the published crate. The
+current public validation consists of reproducible reference vectors, property
+tests, and internal review documented in `PROOFS.md` and the generated test
+data. Treat financial-model use as unaudited until your integration has its own
+review.
