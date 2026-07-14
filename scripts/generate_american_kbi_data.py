@@ -121,6 +121,11 @@ def cross_platform_regeneration_drift(generated: str, committed: str) -> int:
 
     generated_arrays = parse_generated_arrays(generated)
     committed_arrays = parse_generated_arrays(committed)
+    # The payload digest necessarily changes when a platform rounds any Q40
+    # coefficient differently. The exact committed digest remains protected by
+    # CANONICAL_RUST_SHA256; compare the regenerated numerical arrays below.
+    generated_arrays.pop("KBI_DATA_SHA256", None)
+    committed_arrays.pop("KBI_DATA_SHA256", None)
     if generated_arrays.keys() != committed_arrays.keys():
         raise ValueError("generated KBI array set differs from the canonical artifact")
 
