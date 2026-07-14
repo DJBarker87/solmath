@@ -1,0 +1,50 @@
+{
+  "run_date": "2026-07-13T12:46:29.534Z",
+  "target": "Agave local validator at http://127.0.0.1:8899",
+  "measurement": "math CU is the difference between sol_log_compute_units markers; transaction CU is meta.computeUnitsConsumed for the complete Anchor instruction",
+  "program_id": "95cap8Cwznz3PHc3bUMc3Tp28ghySZktkGEWkNDuUGgu",
+  "artifact": "sha256:b7c40646067194b8b071e90adefd0bb6f009e4960c901d44e15ff718addcdaa4",
+  "artifact_bytes": 1446912,
+  "target_max_cu": 200000,
+  "overall_math_max": 185590,
+  "overall_transaction_max": 186610,
+  "headroom_to_target": 13390,
+  "results": [
+    {
+      "name": "arithmetic_asian_price",
+      "corpus": "2,000 deterministic practical-domain runtime inputs",
+      "total": 2000,
+      "measured": 2000,
+      "accepted": 2000,
+      "rejected": 0,
+      "errors": 0,
+      "min": 88268,
+      "average": 137997,
+      "median": 161471,
+      "p95": 177422,
+      "p99": 180029,
+      "max": 182458,
+      "transaction_average": 139017,
+      "transaction_p99": 181049,
+      "transaction_max": 183478
+    },
+    {
+      "name": "arithmetic_asian_price_adversarial",
+      "corpus": "10,000 full-domain and branch-seam runtime inputs; rejected rows are expected SolMathError returns and remain CU-metered",
+      "total": 10000,
+      "measured": 10000,
+      "accepted": 6668,
+      "rejected": 3332,
+      "errors": 0,
+      "min": 272,
+      "average": 68124,
+      "median": 79849,
+      "p95": 166579,
+      "p99": 175987,
+      "max": 185590,
+      "transaction_average": 69145,
+      "transaction_p99": 177007,
+      "transaction_max": 186610
+    }
+  ]
+}

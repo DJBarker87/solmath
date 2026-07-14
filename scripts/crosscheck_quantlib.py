@@ -191,7 +191,15 @@ def main():
             sm_vs_mp[g].append(sig_figs_agreement(sm_v, mp_v))
 
     if errors:
-        print(f"  ({errors} vectors skipped due to errors)\n")
+        raise RuntimeError(
+            f"cross-validation failed closed: {errors}/{len(samples)} vectors "
+            "could not be compared"
+        )
+    if not samples:
+        raise RuntimeError("cross-validation selected zero samples")
+    empty = [g for g in GREEKS if not ql_vs_mp[g] or not sm_vs_ql[g] or not sm_vs_mp[g]]
+    if empty:
+        raise RuntimeError(f"cross-validation produced no comparisons for: {empty}")
 
     # Compute statistics
     def stats(vals):

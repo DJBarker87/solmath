@@ -84,15 +84,29 @@ pub const LN2_HP_LO: i128 = 309_417_232_121_458;
 /// Remez degree-7 ln polynomial as array for compensated evaluation.
 /// Same coefficients as LN_REMEZ_W0..W7, ascending order.
 pub const LN_REMEZ_COEFFS: [i128; 8] = [
-    LN_REMEZ_W0, LN_REMEZ_W1, LN_REMEZ_W2, LN_REMEZ_W3,
-    LN_REMEZ_W4, LN_REMEZ_W5, LN_REMEZ_W6, LN_REMEZ_W7,
+    LN_REMEZ_W0,
+    LN_REMEZ_W1,
+    LN_REMEZ_W2,
+    LN_REMEZ_W3,
+    LN_REMEZ_W4,
+    LN_REMEZ_W5,
+    LN_REMEZ_W6,
+    LN_REMEZ_W7,
 ];
 
 /// HP Remez degree-9 ln polynomial as array for compensated evaluation.
 /// Same coefficients as LN_REMEZ_HP0..HP9, ascending order.
 pub const LN_REMEZ_HP_COEFFS: [i128; 10] = [
-    LN_REMEZ_HP0, LN_REMEZ_HP1, LN_REMEZ_HP2, LN_REMEZ_HP3, LN_REMEZ_HP4,
-    LN_REMEZ_HP5, LN_REMEZ_HP6, LN_REMEZ_HP7, LN_REMEZ_HP8, LN_REMEZ_HP9,
+    LN_REMEZ_HP0,
+    LN_REMEZ_HP1,
+    LN_REMEZ_HP2,
+    LN_REMEZ_HP3,
+    LN_REMEZ_HP4,
+    LN_REMEZ_HP5,
+    LN_REMEZ_HP6,
+    LN_REMEZ_HP7,
+    LN_REMEZ_HP8,
+    LN_REMEZ_HP9,
 ];
 
 // Remez rational coefficients for exp.
@@ -129,6 +143,79 @@ pub enum MulDivRounding {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct U256 {
     pub limbs: [u64; 4],
+}
+
+/// Assemble a 256-bit product from the four exact 64×64 partial products.
+///
+/// Keeping carry propagation separate from partial-product generation gives
+/// the formal harness a solver-sized boundary: the harness can quantify over
+/// every valid partial product and prove each output limb independently.
+#[inline]
+fn assemble_u128_product(p00: u128, p01: u128, p10: u128, p11: u128) -> U256 {
+    const MASK: u128 = u64::MAX as u128;
+
+    // Assemble one base-2^64 column at a time. Every valid column is below
+    // 3*2^64, so it fits comfortably in u128 even though the unsplit middle
+    // partial products would not fit when added directly.
+    let column1 = (p00 >> 64) + (p01 & MASK) + (p10 & MASK);
+    let column2 = (p01 >> 64) + (p10 >> 64) + (p11 & MASK) + (column1 >> 64);
+    let column3 = (p11 >> 64) + (column2 >> 64);
+
+    U256 {
+        limbs: [p00 as u64, column1 as u64, column2 as u64, column3 as u64],
+    }
+}
+
+/// One base-2^64 long-division step.
+///
+/// The precondition `remainder < divisor` makes the quotient digit fit in one
+/// limb. `U256::div_rem_u64` applies this exact transition four times.
+#[inline]
+fn div_rem_u64_step(remainder: u64, limb: u64, divisor: u64) -> (u64, u64) {
+    debug_assert!(divisor != 0);
+    debug_assert!(remainder < divisor);
+    let current = ((remainder as u128) << 64) | limb as u128;
+    (
+        (current / divisor as u128) as u64,
+        (current % divisor as u128) as u64,
+    )
+}
+
+/// Knuth Algorithm D quotient-digit refinement for a normalized two-limb
+/// divisor. Normalization guarantees `v1 >= 2^63`, so at most two decrements
+/// are required before the trial digit is valid or `rhat` crosses the base.
+#[inline]
+fn refine_knuth_quotient_digit(
+    mut qhat: u128,
+    mut rhat: u128,
+    u0: u64,
+    v0: u64,
+    v1: u64,
+) -> (u128, u128) {
+    const BASE: u128 = 1u128 << 64;
+    debug_assert!(qhat < BASE);
+    debug_assert!(u128::from(v1) >= BASE / 2);
+
+    if rhat < BASE {
+        while qhat * u128::from(v0) > (rhat << 64) + u128::from(u0) {
+            debug_assert!(qhat > 0);
+            (qhat, rhat) = advance_knuth_refinement(qhat, rhat, v1);
+            if rhat >= BASE {
+                break;
+            }
+        }
+    }
+    (qhat, rhat)
+}
+
+/// Apply the arithmetic state transition for one Knuth-D3 correction.
+#[inline]
+fn advance_knuth_refinement(qhat: u128, rhat: u128, v1: u64) -> (u128, u128) {
+    const BASE: u128 = 1u128 << 64;
+    debug_assert!(qhat > 0);
+    debug_assert!(rhat < BASE);
+    debug_assert!(u128::from(v1) >= BASE / 2);
+    (qhat - 1, rhat + u128::from(v1))
 }
 
 impl U256 {
@@ -212,24 +299,7 @@ impl U256 {
         let b0 = b as u64 as u128;
         let b1 = (b >> 64) as u64 as u128;
 
-        let t0 = a0 * b0;
-        let p0 = t0 as u64;
-        let carry0 = t0 >> 64;
-
-        // Middle column: a0*b1 + a1*b0 + carry0 can exceed u128.
-        // Use overflowing_add to capture carry bits.
-        let (t1_a, c1) = (a0 * b1).overflowing_add(a1 * b0);
-        let (t1, c2) = t1_a.overflowing_add(carry0);
-        let p1 = t1 as u64;
-        let carry1 = (t1 >> 64) + (c1 as u128 + c2 as u128) * (1u128 << 64);
-
-        let t2 = a1 * b1 + carry1;
-        let p2 = t2 as u64;
-        let p3 = (t2 >> 64) as u64;
-
-        Self {
-            limbs: [p0, p1, p2, p3],
-        }
+        assemble_u128_product(a0 * b0, a0 * b1, a1 * b0, a1 * b1)
     }
 
     /// Lexicographic comparison of two U256 values.
@@ -254,17 +324,13 @@ impl U256 {
     #[inline]
     pub fn div_rem_u64(&self, divisor: u64) -> (Self, u64) {
         let mut quo = [0u64; 4];
-        let mut rem = 0u128;
-        let divisor_u128 = divisor as u128;
+        let mut rem = 0u64;
 
         for i in (0..4).rev() {
-            let limb = self.limbs[i] as u128;
-            let cur = (rem << 64) | limb;
-            quo[i] = (cur / divisor_u128) as u64;
-            rem = cur % divisor_u128;
+            (quo[i], rem) = div_rem_u64_step(rem, self.limbs[i], divisor);
         }
 
-        (Self { limbs: quo }, rem as u64)
+        (Self { limbs: quo }, rem)
     }
 
     /// Divide U256 by u128, returning (quotient, remainder).
@@ -313,18 +379,12 @@ impl U256 {
                 rhat = numerator_hat - qhat * v1_u128;
             }
 
-            // Knuth D3 refinement: only enter when rhat < BASE, because
-            // rhat << 64 overflows u128 when rhat >= 2^64, and in that case
-            // qhat * v0 < BASE^2 ≤ rhat * BASE so the condition is always false.
-            if rhat < BASE {
-                while qhat * v0_u128 > (rhat << 64) + u0 {
-                    qhat -= 1;
-                    rhat += v1_u128;
-                    if rhat >= BASE {
-                        break;
-                    }
-                }
-            }
+            // Knuth D3 refinement. The helper's postcondition proves the loop
+            // requires at most two decrements and keeps every expression in
+            // u128. Once rhat >= BASE the refinement inequality is necessarily
+            // false, so evaluating rhat << 64 is neither needed nor valid.
+            let (refined_qhat, _) = refine_knuth_quotient_digit(qhat, rhat, u0 as u64, v0, v1);
+            qhat = refined_qhat;
 
             let mut carry = 0u128;
             let mut borrow = 0u128;
@@ -380,6 +440,90 @@ impl U256 {
     }
 }
 
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// Prove the carry assembler returns the four exact base-2^64 columns for
+    /// every tuple of valid 64×64 partial products. Since `mul_u128` obtains
+    /// those partial products with non-overflowing u128 multiplication, this
+    /// is the exact 128×128→256 multiplication postcondition.
+    #[kani::proof]
+    fn u256_product_carry_assembly_is_exact() {
+        const BASE: u128 = 1u128 << 64;
+        const MASK: u128 = BASE - 1;
+        const MAX_PARTIAL: u128 = MASK * MASK;
+
+        let p00: u128 = kani::any();
+        let p01: u128 = kani::any();
+        let p10: u128 = kani::any();
+        let p11: u128 = kani::any();
+        kani::assume(p00 <= MAX_PARTIAL);
+        kani::assume(p01 <= MAX_PARTIAL);
+        kani::assume(p10 <= MAX_PARTIAL);
+        kani::assume(p11 <= MAX_PARTIAL);
+
+        let product = assemble_u128_product(p00, p01, p10, p11);
+
+        // Independent overflowing-add specification: add the unsplit middle
+        // products and restore each captured 2^128 carry at the next column.
+        let carry0 = p00 >> 64;
+        let (middle_a, carry_a) = p01.overflowing_add(p10);
+        let (middle, carry_b) = middle_a.overflowing_add(carry0);
+        let carry1 = (middle >> 64) + (u128::from(carry_a) + u128::from(carry_b)) * BASE;
+        let upper = p11 + carry1;
+
+        assert_eq!(product.limbs[0], (p00 & MASK) as u64);
+        assert_eq!(product.limbs[1], (middle & MASK) as u64);
+        assert_eq!(product.limbs[2], (upper & MASK) as u64);
+        assert_eq!(product.limbs[3], (upper >> 64) as u64);
+    }
+
+    /// Prove the concatenated dividend of one long-division step is strictly
+    /// below `divisor * 2^64`, so the quotient digit fits exactly in one limb.
+    /// Rust's unsigned `/` and `%` guarantees then supply the reconstruction
+    /// identity and proper-remainder property for the production step.
+    #[kani::proof]
+    fn u256_div_rem_u64_digit_fits_one_limb() {
+        let remainder: u64 = kani::any();
+        let limb: u64 = kani::any();
+        let divisor: u64 = kani::any();
+        kani::assume(divisor != 0);
+        kani::assume(remainder < divisor);
+
+        let current = ((remainder as u128) << 64) | limb as u128;
+        let exclusive_bound = (divisor as u128) << 64;
+        assert!(current < exclusive_bound);
+    }
+
+    /// Prove two normalized Knuth-D3 correction transitions necessarily move
+    /// `rhat` across the base. The production loop therefore performs at most
+    /// two decrements; every transition is also free of underflow and overflow
+    /// over its complete precondition domain.
+    #[kani::proof]
+    fn knuth_d3_two_corrections_cross_the_base() {
+        const BASE: u128 = 1u128 << 64;
+
+        let qhat: u64 = kani::any();
+        let rhat: u128 = kani::any();
+        let v1: u64 = kani::any();
+        kani::assume(qhat > 0);
+        kani::assume(rhat < BASE);
+        kani::assume(v1 >= 1u64 << 63);
+
+        let (qhat1, rhat1) = advance_knuth_refinement(u128::from(qhat), rhat, v1);
+        assert!(rhat1 < 2 * BASE);
+        assert_eq!(qhat1 + 1, u128::from(qhat));
+
+        if rhat1 < BASE && qhat1 > 0 {
+            let (qhat2, rhat2) = advance_knuth_refinement(qhat1, rhat1, v1);
+            assert!(rhat2 >= BASE);
+            assert!(rhat2 < 2 * BASE);
+            assert_eq!(qhat2 + 2, u128::from(qhat));
+        }
+    }
+}
+
 // ============================================================
 // Gauss-Legendre quadrature nodes and weights (test-only)
 // Generated by scripts/gauss_legendre_coefficients.py — DO NOT EDIT
@@ -431,8 +575,10 @@ pub const PI_SCALE: i128 = 3_141_592_653_590;
 pub const PI_OVER_2_SCALE: i128 = 1_570_796_326_795;
 pub const PI_OVER_4_SCALE: i128 = 785_398_163_397;
 pub const TWO_PI_SCALE: i128 = 6_283_185_307_180;
-pub const TWO_PI_HI: i128 = TWO_PI_SCALE;
-pub const TWO_PI_LO: i128 = -413_500_000_000;
+/// Sub-ULP residual of TWO_PI_SCALE: 2π·SCALE = TWO_PI_SCALE + TWO_PI_LO/SCALE.
+/// 2π·1e12 = 6283185307179.5864769253…, so TWO_PI_SCALE overshoots by
+/// 0.413523074713… ULP. Used by the trig range reduction (Cody-Waite).
+pub const TWO_PI_LO: i128 = -413_523_074_713;
 
 // sin(x)/x = SIN_C1 + SIN_C3·u + ... + SIN_C11·u⁵  where u = x²
 pub const SIN_C1: i128 = 1_000_000_000_000;
@@ -474,7 +620,7 @@ pub const POLY_I0_HI: i128 = 500_000_000_000; // 0.5
 pub const POLY_I1_HI: i128 = 1_500_000_000_000; // 1.5
 pub const POLY_I2_HI: i128 = 3_000_000_000_000; // 3.0
 pub const POLY_I3_HI: i128 = 5_000_000_000_000; // 5.0
-                                            // Piece 4 upper = 8.0 (handled by outer clamp)
+                                                // Piece 4 upper = 8.0 (handled by outer clamp)
 
 // Interval midpoints and half-widths (scaled by 1e12)
 pub const POLY_I0_MID: i128 = 250_000_000_000; // 0.25
@@ -569,69 +715,6 @@ pub const POLY_I4: [i128; 12] = [
 ];
 
 // ============================================================
-// V2 CDF: 6 polynomial pieces + CF8 tail (x >= 5)
-// Rounding Horner, boundary-constrained, coordinate-descent optimized.
-// Max 5 ULP, monotone, zero boundary discontinuity.
-// Generated by scripts/phi_7piece.py
-// ============================================================
-
-pub const POLY_V2_I0_HI: i128 = 500_000_000_000;
-pub const POLY_V2_I1_HI: i128 = 1_500_000_000_000;
-pub const POLY_V2_I2_HI: i128 = 2_250_000_000_000;
-pub const POLY_V2_I3_HI: i128 = 3_000_000_000_000;
-pub const POLY_V2_I4_HI: i128 = 4_000_000_000_000;
-// Piece 5 upper = 5.0 (tail takes over)
-
-pub const POLY_V2_I0_MID: i128 = 250_000_000_000;
-pub const POLY_V2_I0_HW: i128 = 250_000_000_000;
-pub const POLY_V2_I1_MID: i128 = 1_000_000_000_000;
-pub const POLY_V2_I1_HW: i128 = 500_000_000_000;
-pub const POLY_V2_I2_MID: i128 = 1_875_000_000_000;
-pub const POLY_V2_I2_HW: i128 = 375_000_000_000;
-pub const POLY_V2_I3_MID: i128 = 2_625_000_000_000;
-pub const POLY_V2_I3_HW: i128 = 375_000_000_000;
-pub const POLY_V2_I4_MID: i128 = 3_500_000_000_000;
-pub const POLY_V2_I4_HW: i128 = 500_000_000_000;
-pub const POLY_V2_I5_MID: i128 = 4_500_000_000_000;
-pub const POLY_V2_I5_HW: i128 = 500_000_000_000;
-
-// Piece 0: [0.0, 0.5] — max 3 ULP
-pub const POLY_V2_I0: [i128; 12] = [
-    598_706_325_685, 96_667_029_200, -3_020_844_663, -944_013_957,
-    46_217_351, 8_272_417, -471_323, -57_350, 3_612, 332, -25, -5,
-];
-// Piece 1: [0.5, 1.5] — max 5 ULP
-pub const POLY_V2_I1: [i128; 12] = [
-    841_344_746_069, 120_985_362_259, -30_246_340_579, -9,
-    1_260_264_311, -126_026_344, -31_506_998, 6_001_018,
-    469_437, -171_562, -2_238, 3_366,
-];
-// Piece 2: [1.5, 2.25] — max 3 ULP
-pub const POLY_V2_I2: [i128; 12] = [
-    969_603_638_235, 25_794_853_434, -9_068_503_163, 1_520_863_556,
-    -54_796_234, -24_375_030, 3_883_819, 18_049,
-    -60_032, 4_327, 413, -29,
-];
-// Piece 3: [2.25, 3.0] — max 4 ULP
-pub const POLY_V2_I3: [i128; 12] = [
-    995_667_551_638, 4_771_568_097, -2_348_506_182, 658_769_951,
-    -107_075_994, 7_184_753, 828_766, -237_082,
-    16_850, 1_684, -422, -92,
-];
-// Piece 4: [3.0, 4.0] — max 3 ULP
-pub const POLY_V2_I4: [i128; 12] = [
-    999_767_370_921, 436_341_347, -381_798_695, 204_535_012,
-    -73_575_654, 18_081_420, -2_821_622, 167_292,
-    39_482, -11_790, 931, 114,
-];
-// Piece 5: [4.0, 5.0] — max 4 ULP
-pub const POLY_V2_I5: [i128; 12] = [
-    999_996_602_327, 7_991_870, -8_990_869, 6_410_140,
-    -3_230_973, 1_213_662, -347_720, 75_398,
-    -11_582, 1_318, -130, -93,
-];
-
-// ============================================================
 // V2 HP CDF: 6 polynomial pieces + Mills ratio tail (x >= 5)
 // Rounding Horner (fp_mul_hp_i already rounds), boundary-constrained,
 // coordinate-descent optimized. Max 5 ULP.
@@ -659,41 +742,117 @@ pub const POLY_HP_V2_I3B_HW: i128 = 500_000_000_000_000;
 
 // I0: [0.0,0.5] deg=13 max=4 ULP
 pub const POLY_HP_V2_I0: [i128; 14] = [
-    598706325682924, 96667029200713, -3020844662519, -944013957034,
-    46217349936, 8272413929, -471315375, -57342341,
-    3603759, 323049, -21723, -1210, 4, -100,
+    598706325682924,
+    96667029200713,
+    -3020844662519,
+    -944013957034,
+    46217349936,
+    8272413929,
+    -471315375,
+    -57342341,
+    3603759,
+    323049,
+    -21723,
+    -1210,
+    4,
+    -100,
 ];
 // I1: [0.5,1.5] deg=13 max=4 ULP
 pub const POLY_HP_V2_I1: [i128; 14] = [
-    841344746068544, 120985362259572, -30246340565023, -33,
-    1260264191835, -126026418616, -31506612696, 6001256127,
-    468867241, -171906606, -1847116, 3593915, -100208, -55795,
+    841344746068544,
+    120985362259572,
+    -30246340565023,
+    -33,
+    1260264191835,
+    -126026418616,
+    -31506612696,
+    6001256127,
+    468867241,
+    -171906606,
+    -1847116,
+    3593915,
+    -100208,
+    -55795,
 ];
 // I2A: [1.5,2.25] deg=15 max=4 ULP
 pub const POLY_HP_V2_I2A: [i128; 16] = [
-    969603638234739, 25794853435008, -9068503160759, 1520863550899,
-    -54796253049, -24374992132, 3883873087, 17940493,
-    -60092044, 4454506, 433779, -86366, 3277, 5989, -982, -1491,
+    969603638234739,
+    25794853435008,
+    -9068503160759,
+    1520863550899,
+    -54796253049,
+    -24374992132,
+    3883873087,
+    17940493,
+    -60092044,
+    4454506,
+    433779,
+    -86366,
+    3277,
+    5989,
+    -982,
+    -1491,
 ];
 // I2B: [2.25,3.0] deg=15 max=5 ULP
 pub const POLY_HP_V2_I2B: [i128; 16] = [
-    995667551636987, 4771568098811, -2348506173644, 658769960927,
-    -107076056464, 7184669478, 828940223, -236847082,
-    16656613, 1411389, -351615, 22524, 5391, -5946, -829, 1606,
+    995667551636987,
+    4771568098811,
+    -2348506173644,
+    658769960927,
+    -107076056464,
+    7184669478,
+    828940223,
+    -236847082,
+    16656613,
+    1411389,
+    -351615,
+    22524,
+    5391,
+    -5946,
+    -829,
+    1606,
 ];
 // I3A: [3.0,4.0] deg=17 max=5 ULP
 pub const POLY_HP_V2_I3A: [i128; 18] = [
-    999767370920965, 436341347522, -381798679096, 204535006650,
-    -73575786827, 18081462775, -2821236035, 167169387,
-    39009455, -11645489, 1152149, 49566, -6912, 5795,
-    -13949, -1724, 3518, 416,
+    999767370920965,
+    436341347522,
+    -381798679096,
+    204535006650,
+    -73575786827,
+    18081462775,
+    -2821236035,
+    167169387,
+    39009455,
+    -11645489,
+    1152149,
+    49566,
+    -6912,
+    5795,
+    -13949,
+    -1724,
+    3518,
+    416,
 ];
 // I3B: [4.0,5.0] deg=17 max=5 ULP
 pub const POLY_HP_V2_I3B: [i128; 18] = [
-    999996602326874, 7991870552, -8990854373, 6410146188,
-    -3231088291, 1213608926, -347400516, 75547720,
-    -11941734, 1139090, 6868, -3204, 4445, -25983,
-    39, 15785, -15, -3944,
+    999996602326874,
+    7991870552,
+    -8990854373,
+    6410146188,
+    -3231088291,
+    1213608926,
+    -347400516,
+    75547720,
+    -11941734,
+    1139090,
+    6868,
+    -3204,
+    4445,
+    -25983,
+    39,
+    15785,
+    -15,
+    -3944,
 ];
 
 // ---- Derivative coefficients for norm_pdf_poly ----
@@ -975,15 +1134,15 @@ pub struct BsFull {
 // Fitted by scripts/remez_univariate_iv.py (quick grid, 200 DE iterations)
 // Max error: 0.102 σ√T on 9609-point grid
 pub const SQRT_2PI_IV: i128 = 2_506_628_274_631; // √(2π) × SCALE
-pub const PADE_P0: i128 =  1_030_712_890_981;
+pub const PADE_P0: i128 = 1_030_712_890_981;
 pub const PADE_P1: i128 = -3_523_716_038_286;
-pub const PADE_P2: i128 =  2_286_295_838_170;
-pub const PADE_P3: i128 =    148_646_789_634;
-pub const PADE_P4: i128 =     72_825_165_192;
+pub const PADE_P2: i128 = 2_286_295_838_170;
+pub const PADE_P3: i128 = 148_646_789_634;
+pub const PADE_P4: i128 = 72_825_165_192;
 pub const PADE_Q1: i128 = -2_282_582_703_163;
-pub const PADE_Q2: i128 =   -135_934_203_446;
-pub const PADE_Q3: i128 =    -77_424_332_735;
-pub const PADE_Q4: i128 =        446_572_216;
+pub const PADE_Q2: i128 = -135_934_203_446;
+pub const PADE_Q3: i128 = -77_424_332_735;
+pub const PADE_Q4: i128 = 446_572_216;
 
 // ============================================================
 // Li rational polynomial constants for implied volatility
@@ -1034,13 +1193,6 @@ pub const LI_M: [i128; 14] = [
 ];
 
 // ============================================================
-// NIG Option Pricing via COS method (Fang & Oosterlee 2008)
-// ============================================================
-
-pub const NIG_COS_N: usize = 17; // cosine expansion terms
-pub const NIG_COS_L: i128 = 6_750_000_000_000; // truncation L=6.75 std devs (SCALE units)
-
-// ============================================================
 // AS241 inverse normal CDF coefficients (all scaled by 1e12)
 // Reference: Applied Statistics algorithm AS241 (1988)
 // 3-branch rational polynomial, ~12 significant digits at SCALE.
@@ -1055,124 +1207,124 @@ pub const SQRT_PI_OVER_TWO: i128 = 1_253_314_137_316;
 pub const TWO_PI_SCALED: i128 = 6_283_185_307_180;
 pub const SQRT_THREE_SCALED: i128 = 1_732_050_807_569;
 
-pub const AS241_SPLIT1: i128 = 425_000_000_000;     // 0.425
-pub const AS241_CONST1: i128 = 180_625_000_000;     // 0.180625
-pub const AS241_SPLIT2: i128 = 5_000_000_000_000;   // 5.0
-pub const AS241_CONST2: i128 = 1_600_000_000_000;   // 1.6
+pub const AS241_SPLIT1: i128 = 425_000_000_000; // 0.425
+pub const AS241_CONST1: i128 = 180_625_000_000; // 0.180625
+pub const AS241_SPLIT2: i128 = 5_000_000_000_000; // 5.0
+pub const AS241_CONST2: i128 = 1_600_000_000_000; // 1.6
 
 // Branch 1 numerator: P close to 0.5
 pub const AS241_A: [i128; 8] = [
-    3_387_132_872_796,          // A0
-    133_141_667_891_784,        // A1
-    1_971_590_950_306_551,      // A2
-    13_731_693_765_509_461,     // A3
-    45_921_953_931_549_871,     // A4
-    67_265_770_927_008_701,     // A5
-    33_430_575_583_588_128,     // A6
-    2_509_080_928_730_123,      // A7
+    3_387_132_872_796,      // A0
+    133_141_667_891_784,    // A1
+    1_971_590_950_306_551,  // A2
+    13_731_693_765_509_461, // A3
+    45_921_953_931_549_871, // A4
+    67_265_770_927_008_701, // A5
+    33_430_575_583_588_128, // A6
+    2_509_080_928_730_123,  // A7
 ];
 
 // Branch 1 denominator
 pub const AS241_B: [i128; 7] = [
-    42_313_330_701_601,         // B1
-    687_187_007_492_058,        // B2
-    5_394_196_021_424_751,      // B3
-    21_213_794_301_586_596,     // B4
-    39_307_895_800_092_711,     // B5
-    28_729_085_735_721_943,     // B6
-    5_226_495_278_852_855,      // B7
+    42_313_330_701_601,     // B1
+    687_187_007_492_058,    // B2
+    5_394_196_021_424_751,  // B3
+    21_213_794_301_586_596, // B4
+    39_307_895_800_092_711, // B5
+    28_729_085_735_721_943, // B6
+    5_226_495_278_852_855,  // B7
 ];
 
 // Branch 2 numerator: P not close to 0, 0.5, or 1
 pub const AS241_C: [i128; 8] = [
-    1_423_437_110_750,          // C0
-    4_630_337_846_157,          // C1
-    5_769_497_221_461,          // C2
-    3_647_848_324_763,          // C3
-    1_270_458_252_452,          // C4
-    241_780_725_177,            // C5
-    22_723_844_989,             // C6
-    774_545_014,                // C7
+    1_423_437_110_750, // C0
+    4_630_337_846_157, // C1
+    5_769_497_221_461, // C2
+    3_647_848_324_763, // C3
+    1_270_458_252_452, // C4
+    241_780_725_177,   // C5
+    22_723_844_989,    // C6
+    774_545_014,       // C7
 ];
 
 // Branch 2 denominator
 pub const AS241_D: [i128; 7] = [
-    2_053_191_626_638,          // D1
-    1_676_384_830_184,          // D2
-    689_767_334_985,            // D3
-    148_103_976_427,            // D4
-    15_198_666_564,             // D5
-    547_593_808,                // D6
-    1_051,                      // D7
+    2_053_191_626_638, // D1
+    1_676_384_830_184, // D2
+    689_767_334_985,   // D3
+    148_103_976_427,   // D4
+    15_198_666_564,    // D5
+    547_593_808,       // D6
+    1_051,             // D7
 ];
 
 // Branch 3 numerator: P very close to 0 or 1
 pub const AS241_E: [i128; 8] = [
-    6_657_904_643_501,          // E0
-    5_463_784_911_164,          // E1
-    1_784_826_539_917,          // E2
-    296_560_571_829,            // E3
-    26_532_189_527,             // E4
-    1_242_660_947,              // E5
-    27_115_556,                 // E6
-    201_033,                    // E7
+    6_657_904_643_501, // E0
+    5_463_784_911_164, // E1
+    1_784_826_539_917, // E2
+    296_560_571_829,   // E3
+    26_532_189_527,    // E4
+    1_242_660_947,     // E5
+    27_115_556,        // E6
+    201_033,           // E7
 ];
 
 // Branch 3 denominator
 pub const AS241_F: [i128; 7] = [
-    599_832_206_556,            // F1
-    136_929_880_923,            // F2
-    14_875_361_291,             // F3
-    786_869_131,                // F4
-    18_463_183,                 // F5
-    142_151,                    // F6
-    0,                          // F7 (2.04e-15, rounds to 0)
+    599_832_206_556, // F1
+    136_929_880_923, // F2
+    14_875_361_291,  // F3
+    786_869_131,     // F4
+    18_463_183,      // F5
+    142_151,         // F6
+    0,               // F7 (2.04e-15, rounds to 0)
 ];
 
 // AS241 Branch 2b/2c split points and coefficients (5-branch inverse CDF).
-pub const AS241_SPLIT_2B: i128 = 3_000_000_000_000;   // 3.0
-pub const AS241_CENTER_2B: i128 = 3_500_000_000_000;   // 3.5
-pub const AS241_SPLIT_2C: i128 = 4_000_000_000_000;   // 4.0
-pub const AS241_CENTER_2C: i128 = 4_500_000_000_000;   // 4.5
+pub const AS241_SPLIT_2B: i128 = 3_000_000_000_000; // 3.0
+pub const AS241_CENTER_2B: i128 = 3_500_000_000_000; // 3.5
+pub const AS241_SPLIT_2C: i128 = 4_000_000_000_000; // 4.0
+pub const AS241_CENTER_2C: i128 = 4_500_000_000_000; // 4.5
 
 pub const AS241_G: [i128; 8] = [
     4_426_662_374_924,
-       88_005_498_751,
-      -41_160_164_851,
-       39_126_451_267,
-      -58_494_244_713,
-       66_910_003_962,
-       33_959_185_442,
-        3_528_770_658,
+    88_005_498_751,
+    -41_160_164_851,
+    39_126_451_267,
+    -58_494_244_713,
+    66_910_003_962,
+    33_959_185_442,
+    3_528_770_658,
 ];
 pub const AS241_H: [i128; 7] = [
-     -321_373_526_953,
-      105_028_553_616,
-      -29_555_849_092,
-       -2_051_462_415,
-       15_427_578_835,
-        2_488_089_624,
-             293_654,
+    -321_373_526_953,
+    105_028_553_616,
+    -29_555_849_092,
+    -2_051_462_415,
+    15_427_578_835,
+    2_488_089_624,
+    293_654,
 ];
 
 pub const AS241_I: [i128; 8] = [
     5_920_458_342_163,
-       44_499_785_186,
-      -13_437_857_419,
-       10_089_893_956,
-      -18_863_036_526,
-       29_961_578_652,
-       10_532_292_799,
-          830_578_919,
+    44_499_785_186,
+    -13_437_857_419,
+    10_089_893_956,
+    -18_863_036_526,
+    29_961_578_652,
+    10_532_292_799,
+    830_578_919,
 ];
 pub const AS241_J: [i128; 7] = [
-     -242_472_999_986,
-       60_245_461_302,
-      -14_160_150_896,
-          615_344_034,
-        4_831_648_864,
-          586_268_402,
-              34_994,
+    -242_472_999_986,
+    60_245_461_302,
+    -14_160_150_896,
+    615_344_034,
+    4_831_648_864,
+    586_268_402,
+    34_994,
 ];
 
 /// Step size for 16-entry ln table: SCALE / 16.
@@ -1189,85 +1341,85 @@ pub const LN_TABLE_HP_HALF_STEP: u128 = SCALE_HP_U / 32;
 /// Entry j = round(ln(1 + (2j+1)/32) × SCALE).
 /// Midpoint of interval j is SCALE + (2j+1) × SCALE/32.
 pub const LN_TABLE_16: [i128; 16] = [
-             30771658667, // j= 0: ln(1.03125)
-             89612158690, // j= 1: ln(1.09375)
-            145182009844, // j= 2: ln(1.15625)
-            197825743330, // j= 3: ln(1.21875)
-            247836163905, // j= 4: ln(1.28125)
-            295464212894, // j= 5: ln(1.34375)
-            340926586971, // j= 6: ln(1.40625)
-            384411698910, // j= 7: ln(1.46875)
-            426084395311, // j= 8: ln(1.53125)
-            466089729925, // j= 9: ln(1.59375)
-            504556010752, // j=10: ln(1.65625)
-            541597282433, // j=11: ln(1.71875)
-            577315365035, // j=12: ln(1.78125)
-            611801541106, // j=13: ln(1.84375)
-            645137961374, // j=14: ln(1.90625)
-            677398823592, // j=15: ln(1.96875)
+    30771658667,  // j= 0: ln(1.03125)
+    89612158690,  // j= 1: ln(1.09375)
+    145182009844, // j= 2: ln(1.15625)
+    197825743330, // j= 3: ln(1.21875)
+    247836163905, // j= 4: ln(1.28125)
+    295464212894, // j= 5: ln(1.34375)
+    340926586971, // j= 6: ln(1.40625)
+    384411698910, // j= 7: ln(1.46875)
+    426084395311, // j= 8: ln(1.53125)
+    466089729925, // j= 9: ln(1.59375)
+    504556010752, // j=10: ln(1.65625)
+    541597282433, // j=11: ln(1.71875)
+    577315365035, // j=12: ln(1.78125)
+    611801541106, // j=13: ln(1.84375)
+    645137961374, // j=14: ln(1.90625)
+    677398823592, // j=15: ln(1.96875)
 ];
 
 /// Sub-ULP residuals for LN_TABLE_16.
 /// true_ln(midpoint) × SCALE = LN_TABLE_16[j] + LN_TABLE_LO_16[j] / SCALE.
 /// |LN_TABLE_LO_16[j]| < SCALE. Generated with mpmath at 60 decimal digits.
 pub const LN_TABLE_LO_16: [i128; 16] = [
-           -246311628972, // j= 0
-           -312867380049, // j= 1
-            497897281935, // j= 2
-            -80119637428, // j= 3
-           -418743219397, // j= 4
-           -164123613318, // j= 5
-           -406789694911, // j= 6
-            332039734790, // j= 7
-            -99936875455, // j= 8
-           -400775441381, // j= 9
-            395287058309, // j=10
-           -255628423458, // j=11
-           -176395681888, // j=12
-             -7096470110, // j=13
-           -415298334772, // j=14
-           -193859190317, // j=15
+    -246311628972, // j= 0
+    -312867380049, // j= 1
+    497897281935,  // j= 2
+    -80119637428,  // j= 3
+    -418743219397, // j= 4
+    -164123613318, // j= 5
+    -406789694911, // j= 6
+    332039734790,  // j= 7
+    -99936875455,  // j= 8
+    -400775441381, // j= 9
+    395287058309,  // j=10
+    -255628423458, // j=11
+    -176395681888, // j=12
+    -7096470110,   // j=13
+    -415298334772, // j=14
+    -193859190317, // j=15
 ];
 
 /// HP 16-entry lookup table for table-assisted ln at SCALE_HP = 1e15.
 pub const LN_TABLE_HP_16: [i128; 16] = [
-             30771658666754, // j= 0: ln(1.03125)
-             89612158689687, // j= 1: ln(1.09375)
-            145182009844498, // j= 2: ln(1.15625)
-            197825743329920, // j= 3: ln(1.21875)
-            247836163904581, // j= 4: ln(1.28125)
-            295464212893836, // j= 5: ln(1.34375)
-            340926586970593, // j= 6: ln(1.40625)
-            384411698910332, // j= 7: ln(1.46875)
-            426084395310900, // j= 8: ln(1.53125)
-            466089729924599, // j= 9: ln(1.59375)
-            504556010752395, // j=10: ln(1.65625)
-            541597282432744, // j=11: ln(1.71875)
-            577315365034824, // j=12: ln(1.78125)
-            611801541105993, // j=13: ln(1.84375)
-            645137961373585, // j=14: ln(1.90625)
-            677398823591806, // j=15: ln(1.96875)
+    30771658666754,  // j= 0: ln(1.03125)
+    89612158689687,  // j= 1: ln(1.09375)
+    145182009844498, // j= 2: ln(1.15625)
+    197825743329920, // j= 3: ln(1.21875)
+    247836163904581, // j= 4: ln(1.28125)
+    295464212893836, // j= 5: ln(1.34375)
+    340926586970593, // j= 6: ln(1.40625)
+    384411698910332, // j= 7: ln(1.46875)
+    426084395310900, // j= 8: ln(1.53125)
+    466089729924599, // j= 9: ln(1.59375)
+    504556010752395, // j=10: ln(1.65625)
+    541597282432744, // j=11: ln(1.71875)
+    577315365034824, // j=12: ln(1.78125)
+    611801541105993, // j=13: ln(1.84375)
+    645137961373585, // j=14: ln(1.90625)
+    677398823591806, // j=15: ln(1.96875)
 ];
 
 /// Sub-ULP residuals for LN_TABLE_HP_16.
 /// true_ln(midpoint) × SCALE_HP = LN_TABLE_HP_16[j] + LN_TABLE_HP_LO_16[j] / SCALE_HP.
 pub const LN_TABLE_HP_LO_16: [i128; 16] = [
-           -311628971792403, // j= 0
-            132619951469378, // j= 1
-           -102718064936259, // j= 2
-           -119637427928803, // j= 3
-            256780602765747, // j= 4
-           -123613318093945, // j= 5
-            210305089199780, // j= 6
-             39734790062481, // j= 7
-             63124544879595, // j= 8
-            224558619247505, // j= 9
-            287058308531738, // j=10
-            371576542303900, // j=11
-           -395681887938481, // j=12
-            -96470110233571, // j=13
-           -298334771503865, // j=14
-            140809682609997, // j=15
+    -311628971792403, // j= 0
+    132619951469378,  // j= 1
+    -102718064936259, // j= 2
+    -119637427928803, // j= 3
+    256780602765747,  // j= 4
+    -123613318093945, // j= 5
+    210305089199780,  // j= 6
+    39734790062481,   // j= 7
+    63124544879595,   // j= 8
+    224558619247505,  // j= 9
+    287058308531738,  // j=10
+    371576542303900,  // j=11
+    -395681887938481, // j=12
+    -96470110233571,  // j=13
+    -298334771503865, // j=14
+    140809682609997,  // j=15
 ];
 
 #[cfg(test)]
@@ -1276,14 +1428,20 @@ mod tests {
 
     #[test]
     fn test_ln2_lo_sub_ulp() {
-        assert!((LN2_LO as u128) < SCALE || ((-LN2_LO) as u128) < SCALE,
-            "LN2_LO={} not sub-ULP", LN2_LO);
+        assert!(
+            (LN2_LO as u128) < SCALE || ((-LN2_LO) as u128) < SCALE,
+            "LN2_LO={} not sub-ULP",
+            LN2_LO
+        );
     }
 
     #[test]
     fn test_ln2_hp_lo_sub_ulp() {
-        assert!((LN2_HP_LO.unsigned_abs()) < SCALE_HP_U,
-            "LN2_HP_LO={} not sub-ULP", LN2_HP_LO);
+        assert!(
+            (LN2_HP_LO.unsigned_abs()) < SCALE_HP_U,
+            "LN2_HP_LO={} not sub-ULP",
+            LN2_HP_LO
+        );
     }
 
     #[test]
@@ -1309,8 +1467,12 @@ mod tests {
             } else {
                 (raw - SCALE_I / 2) / SCALE_I
             };
-            assert!(correction.abs() <= 10,
-                "Correction too large at k={}: {}", k, correction);
+            assert!(
+                correction.abs() <= 10,
+                "Correction too large at k={}: {}",
+                k,
+                correction
+            );
         }
     }
 
@@ -1330,26 +1492,40 @@ mod tests {
     #[test]
     fn test_ln_table_lo_sub_ulp() {
         for j in 0..16 {
-            assert!(LN_TABLE_LO_16[j].unsigned_abs() < SCALE,
-                "LN_TABLE_LO_16[{}]={} not sub-ULP", j, LN_TABLE_LO_16[j]);
+            assert!(
+                LN_TABLE_LO_16[j].unsigned_abs() < SCALE,
+                "LN_TABLE_LO_16[{}]={} not sub-ULP",
+                j,
+                LN_TABLE_LO_16[j]
+            );
         }
     }
 
     #[test]
     fn test_ln_table_hp_lo_sub_ulp() {
         for j in 0..16 {
-            assert!(LN_TABLE_HP_LO_16[j].unsigned_abs() < SCALE_HP_U,
-                "LN_TABLE_HP_LO_16[{}]={} not sub-ULP", j, LN_TABLE_HP_LO_16[j]);
+            assert!(
+                LN_TABLE_HP_LO_16[j].unsigned_abs() < SCALE_HP_U,
+                "LN_TABLE_HP_LO_16[{}]={} not sub-ULP",
+                j,
+                LN_TABLE_HP_LO_16[j]
+            );
         }
     }
 
     #[test]
     fn test_ln_table_monotone() {
         for j in 1..16 {
-            assert!(LN_TABLE_16[j] > LN_TABLE_16[j-1],
-                "LN_TABLE_16 not monotone at j={}", j);
-            assert!(LN_TABLE_HP_16[j] > LN_TABLE_HP_16[j-1],
-                "LN_TABLE_HP_16 not monotone at j={}", j);
+            assert!(
+                LN_TABLE_16[j] > LN_TABLE_16[j - 1],
+                "LN_TABLE_16 not monotone at j={}",
+                j
+            );
+            assert!(
+                LN_TABLE_HP_16[j] > LN_TABLE_HP_16[j - 1],
+                "LN_TABLE_HP_16 not monotone at j={}",
+                j
+            );
         }
     }
 }

@@ -3,7 +3,7 @@
 
 #[cfg(test)]
 mod quantlib_sabr {
-    use crate::sabr::sabr_implied_vol;
+    use solmath::sabr_implied_vol;
 
     #[test]
     fn ql_sabr_0000() {

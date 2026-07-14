@@ -3,12 +3,16 @@
 // Uses Haug building blocks A, B, C, D with eta = phi (not barrier direction).
 // Verified against QuantLib AnalyticBarrierEngine on 443K vectors.
 //
-// All arithmetic at HP precision (1e15). Single barriers: ~160K CU.
+// All arithmetic at HP precision (1e15). Final SBF audit: 270,156 CU average,
+// 415,531 max for the legacy/unbreached calculation.
 
+use crate::arithmetic::{fp_div_i, fp_mul_i, isqrt_u128};
 use crate::constants::*;
 use crate::error::SolMathError;
-use crate::arithmetic::{fp_mul_i, fp_div_i, isqrt_u128};
-use crate::hp::{black_scholes_price_hp, fp_mul_hp_i, fp_div_hp_safe, upscale_std_to_hp, downscale_hp_to_std, ln_fixed_hp, exp_fixed_hp, norm_cdf_poly_hp};
+use crate::hp::{
+    black_scholes_price_hp, downscale_hp_to_std, exp_fixed_hp, fp_div_hp_safe, fp_mul_hp_i,
+    ln_fixed_hp, norm_cdf_poly_hp, upscale_std_to_hp,
+};
 
 /// Barrier option type (single barrier, European exercise).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,8 +58,12 @@ struct HaugIntermediates {
 /// eta = phi (call/put sign), NOT barrier direction.
 #[inline(never)]
 fn compute_intermediates(
-    s: u128, k: u128, h: u128,
-    r: u128, sigma: u128, t: u128,
+    s: u128,
+    k: u128,
+    h: u128,
+    r: u128,
+    sigma: u128,
+    t: u128,
     is_call: bool,
 ) -> Result<HaugIntermediates, SolMathError> {
     let s_hp = upscale_std_to_hp(s)?;
@@ -65,7 +73,11 @@ fn compute_intermediates(
     let sigma_hp = upscale_std_to_hp(sigma)?;
     let t_hp = upscale_std_to_hp(t)?;
 
-    let sqrt_t_hp = isqrt_u128((t_hp as u128).checked_mul(SCALE_HP_U).ok_or(SolMathError::Overflow)?) as i128;
+    let sqrt_t_hp = isqrt_u128(
+        (t_hp as u128)
+            .checked_mul(SCALE_HP_U)
+            .ok_or(SolMathError::Overflow)?,
+    ) as i128;
     let sigma_sqrt_t_hp = fp_mul_hp_i(sigma_hp, sqrt_t_hp)?;
 
     let r_t_hp = fp_mul_hp_i(r_hp, t_hp)?;
@@ -73,7 +85,10 @@ fn compute_intermediates(
     let k_disc_hp = fp_mul_hp_i(k_hp, discount_hp)?;
 
     let sigma_sq_hp = fp_mul_hp_i(sigma_hp, sigma_hp)?;
-    let drift_hp = fp_mul_hp_i(r_hp + sigma_sq_hp / 2, t_hp)?;
+    let drift_rate_hp = r_hp
+        .checked_add(sigma_sq_hp / 2)
+        .ok_or(SolMathError::Overflow)?;
+    let drift_hp = fp_mul_hp_i(drift_rate_hp, t_hp)?;
     let lambda_sst = if sigma_sqrt_t_hp > 0 {
         fp_div_hp_safe(drift_hp, sigma_sqrt_t_hp)?
     } else {
@@ -87,7 +102,9 @@ fn compute_intermediates(
     let mk = |log_val: i128| -> Result<i128, SolMathError> {
         if sigma_sqrt_t_hp > 0 {
             // fp_div_hp_safe result ∈ [-~1e15, ~1e15]; lambda_sst ∈ [-~1e15, ~1e15] (finite-rate drift); sum ≤ ~2e15, fits i128
-            Ok(fp_div_hp_safe(log_val, sigma_sqrt_t_hp)? + lambda_sst)
+            fp_div_hp_safe(log_val, sigma_sqrt_t_hp)?
+                .checked_add(lambda_sst)
+                .ok_or(SolMathError::Overflow)
         } else {
             Ok(0)
         }
@@ -97,12 +114,19 @@ fn compute_intermediates(
     let x1_hp = mk(ln_sh)?;
     let y1_hp = mk(-ln_sh)?;
     // -ln_sh ∈ [-~1e15, ~1e15], ln_hk ∈ [-~1e15, ~1e15]; sum ≤ ~2e15, fits i128
-    let y_hp = mk(-ln_sh + ln_hk)?;
+    let y_hp = mk(ln_sh
+        .checked_neg()
+        .and_then(|v| v.checked_add(ln_hk))
+        .ok_or(SolMathError::Overflow)?)?;
 
     // Power terms at HP via exp(2λ·ln(H/S))
     let sigma_sq_std = fp_mul_i(sigma as i128, sigma as i128)?;
     // r as i128 ≤ ~1e12 (rate at SCALE), sigma_sq_std ≤ SCALE (volatility² ≤ 1.0 at SCALE); sum ≤ ~2e12, fits i128
-    let two_lambda_std = fp_div_i(2 * (r as i128 + sigma_sq_std / 2), sigma_sq_std)?;
+    let lambda_num = (r as i128)
+        .checked_add(sigma_sq_std / 2)
+        .and_then(|v| v.checked_mul(2))
+        .ok_or(SolMathError::Overflow)?;
+    let two_lambda_std = fp_div_i(lambda_num, sigma_sq_std)?;
     let two_lambda_hp = upscale_std_to_hp(two_lambda_std as u128)?;
     // two_lambda_hp ≤ ~100·SCALE_HP (lambda is a dimensionless financial ratio, typically ≤ 100); 2·SCALE_HP ≈ 2e15; no underflow for lambda > 1
     let two_lambda_m2_hp = two_lambda_hp - 2 * SCALE_HP;
@@ -120,8 +144,16 @@ fn compute_intermediates(
     };
 
     Ok(HaugIntermediates {
-        s_hp, k_disc_hp, x1_hp, y1_hp, d1_hp, y_hp,
-        sigma_sqrt_t_hp, discount_hp, pow_2l_hp, pow_2lm2_hp,
+        s_hp,
+        k_disc_hp,
+        x1_hp,
+        y1_hp,
+        d1_hp,
+        y_hp,
+        sigma_sqrt_t_hp,
+        discount_hp,
+        pow_2l_hp,
+        pow_2lm2_hp,
         phi: if is_call { 1 } else { -1 },
     })
 }
@@ -137,10 +169,9 @@ fn block_hp(phi: i128, z: i128, s_eff: i128, k_eff: i128, sst: i128) -> Result<i
     // phi * z, phi * (z - sst): sign flips only, magnitude unchanged, fits i128
     // fp_mul_hp_i outputs ∈ [-~1e15, ~1e15] (price × N(·) where N ∈ [0,1]); difference ≤ ~2e15, fits i128
     // outer phi * (...): sign flip, magnitude unchanged; fits i128
-    Ok(phi * (
-        fp_mul_hp_i(s_eff, norm_cdf_poly_hp(phi * z)?)?
-        - fp_mul_hp_i(k_eff, norm_cdf_poly_hp(phi * (z - sst))?)?
-    ))
+    Ok(phi
+        * (fp_mul_hp_i(s_eff, norm_cdf_poly_hp(phi * z)?)?
+            - fp_mul_hp_i(k_eff, norm_cdf_poly_hp(phi * (z - sst))?)?))
 }
 
 /// Compute all 4 building blocks: (A, B, C, D).
@@ -162,6 +193,12 @@ fn all_blocks(im: &HaugIntermediates) -> Result<(i128, i128, i128, i128), SolMat
 /// Prices a European option with a single knock-in or knock-out barrier
 /// using Haug's ABCD decomposition, verified against QuantLib on 443K vectors.
 ///
+/// This formula assumes continuous monitoring, zero rebate, no dividends, and
+/// that the barrier has **not** been breached before the valuation instant.
+/// On-chain callers with persisted path state should use
+/// [`barrier_option_with_state`]. Discretely sampled oracle barriers require a
+/// separate monitoring correction and must not be priced as continuous.
+///
 /// # Parameters
 /// - `s` -- Spot price at SCALE (u128)
 /// - `k` -- Strike price at SCALE (u128)
@@ -176,7 +213,8 @@ fn all_blocks(im: &HaugIntermediates) -> Result<(i128, i128, i128, i128), SolMat
 /// Returns `Err(DomainError)` if `s`, `k`, `h`, `sigma`, or `t` are zero.
 ///
 /// # Accuracy
-/// Max 1.7K ULP, P99 33, median 1. CU: ~160K average.
+/// Max 1.7K ULP, P99 33, median 1. Final SBF audit: 270,156 CU
+/// average and 415,531 max for this math call.
 ///
 /// Public return values preserve exact in/out conservation after rounding.
 ///
@@ -193,8 +231,12 @@ fn all_blocks(im: &HaugIntermediates) -> Result<(i128, i128, i128, i128), SolMat
 /// # Ok::<(), solmath::SolMathError>(())
 /// ```
 pub fn barrier_option(
-    s: u128, k: u128, h: u128,
-    r: u128, sigma: u128, t: u128,
+    s: u128,
+    k: u128,
+    h: u128,
+    r: u128,
+    sigma: u128,
+    t: u128,
     is_call: bool,
     barrier_type: BarrierType,
 ) -> Result<BarrierResult, SolMathError> {
@@ -202,24 +244,39 @@ pub fn barrier_option(
         return Err(SolMathError::DomainError);
     }
 
-    let is_down = matches!(barrier_type, BarrierType::DownAndOut | BarrierType::DownAndIn);
-    let is_out = matches!(barrier_type, BarrierType::DownAndOut | BarrierType::UpAndOut);
+    let is_down = matches!(
+        barrier_type,
+        BarrierType::DownAndOut | BarrierType::DownAndIn
+    );
+    let is_out = matches!(
+        barrier_type,
+        BarrierType::DownAndOut | BarrierType::UpAndOut
+    );
 
     // Already at or past barrier
     if (is_down && s <= h) || (!is_down && s >= h) {
         let (call, put) = black_scholes_price_hp(s, k, r, sigma, t)?;
         let vanilla = if is_call { call } else { put };
-        return Ok(BarrierResult { price: if is_out { 0 } else { vanilla }, vanilla });
+        return Ok(BarrierResult {
+            price: if is_out { 0 } else { vanilla },
+            vanilla,
+        });
     }
 
     // Impossible payoff: up call K≥H, down put K≤H
     if is_call && !is_down && k >= h {
         let (call, _) = black_scholes_price_hp(s, k, r, sigma, t)?;
-        return Ok(BarrierResult { price: if is_out { 0 } else { call }, vanilla: call });
+        return Ok(BarrierResult {
+            price: if is_out { 0 } else { call },
+            vanilla: call,
+        });
     }
     if !is_call && is_down && k <= h {
         let (_, put) = black_scholes_price_hp(s, k, r, sigma, t)?;
-        return Ok(BarrierResult { price: if is_out { 0 } else { put }, vanilla: put });
+        return Ok(BarrierResult {
+            price: if is_out { 0 } else { put },
+            vanilla: put,
+        });
     }
 
     let im = compute_intermediates(s, k, h, r, sigma, t, is_call)?;
@@ -244,7 +301,10 @@ pub fn barrier_option(
         let digital_hp = fp_mul_hp_i(
             im.discount_hp,
             norm_cdf_poly_hp(im.sigma_sqrt_t_hp - im.x1_hp)?
-                - fp_mul_hp_i(im.pow_2lm2_hp, norm_cdf_poly_hp(im.sigma_sqrt_t_hp - im.y1_hp)?)?,
+                - fp_mul_hp_i(
+                    im.pow_2lm2_hp,
+                    norm_cdf_poly_hp(im.sigma_sqrt_t_hp - im.y1_hp)?,
+                )?,
         )?;
 
         // p_uo_h_hp ∈ [-~1e20, ~1e20]; fp_mul_hp_i of (k-h) upscaled × digital ∈ [-~1e20, ~1e20]; sum ≤ ~2e20, fits i128
@@ -265,7 +325,80 @@ pub fn barrier_option(
 
     let vanilla = downscale_hp_to_std(vanilla_hp);
     let out_price = core::cmp::min(downscale_hp_to_std(out_hp), vanilla);
-    let price = if is_out { out_price } else { vanilla - out_price };
+    let price = if is_out {
+        out_price
+    } else {
+        vanilla - out_price
+    };
 
     Ok(BarrierResult { price, vanilla })
+}
+
+/// Path-state-aware barrier pricing.
+///
+/// Set `barrier_was_breached` from persisted contract/oracle state. Once
+/// breached, a knock-out is worth zero and a knock-in is worth the vanilla
+/// option regardless of the current spot.
+pub fn barrier_option_with_state(
+    s: u128,
+    k: u128,
+    h: u128,
+    r: u128,
+    sigma: u128,
+    t: u128,
+    is_call: bool,
+    barrier_type: BarrierType,
+    barrier_was_breached: bool,
+) -> Result<BarrierResult, SolMathError> {
+    if !barrier_was_breached {
+        return barrier_option(s, k, h, r, sigma, t, is_call, barrier_type);
+    }
+    if s == 0 || k == 0 || h == 0 || sigma == 0 || t == 0 {
+        return Err(SolMathError::DomainError);
+    }
+    let (call, put) = black_scholes_price_hp(s, k, r, sigma, t)?;
+    let vanilla = if is_call { call } else { put };
+    let knocked_out = matches!(
+        barrier_type,
+        BarrierType::DownAndOut | BarrierType::UpAndOut
+    );
+    Ok(BarrierResult {
+        price: if knocked_out { 0 } else { vanilla },
+        vanilla,
+    })
+}
+
+#[cfg(test)]
+mod path_state_tests {
+    use super::*;
+
+    #[test]
+    fn historical_breach_overrides_current_safe_spot() {
+        let out = barrier_option_with_state(
+            100 * SCALE,
+            100 * SCALE,
+            90 * SCALE,
+            50_000_000_000,
+            200_000_000_000,
+            SCALE,
+            true,
+            BarrierType::DownAndOut,
+            true,
+        )
+        .unwrap();
+        let knocked_in = barrier_option_with_state(
+            100 * SCALE,
+            100 * SCALE,
+            90 * SCALE,
+            50_000_000_000,
+            200_000_000_000,
+            SCALE,
+            true,
+            BarrierType::DownAndIn,
+            true,
+        )
+        .unwrap();
+        assert_eq!(out.price, 0);
+        assert_eq!(knocked_in.price, knocked_in.vanilla);
+    }
 }

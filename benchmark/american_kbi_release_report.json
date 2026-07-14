@@ -1,0 +1,79 @@
+{
+  "method": "compiled SolMath KBI versus QuantLib 1.41 QdFp accurateScheme",
+  "runtime_model": "all six-input-dependent boundary reconstruction and early-exercise-premium integration execute on-chain",
+  "accuracy_units": "absolute dollars at a $100 strike",
+  "accuracy_statistics_are_rounded_as_published": true,
+  "accuracy": {
+    "production": {
+      "requested_per_leg": 100000,
+      "in_domain_and_accepted_per_leg": 78047,
+      "call": {
+        "median": 0.0000156,
+        "p95": 0.0006946,
+        "p99": 0.0013619,
+        "maximum": 0.0027441,
+        "percent_within_0_001": 97.57
+      },
+      "put": {
+        "median": 0.0000160,
+        "p95": 0.0007078,
+        "p99": 0.0014208,
+        "maximum": 0.0032638,
+        "percent_within_0_001": 97.46
+      }
+    },
+    "adversarial": {
+      "requested_per_leg": 10000,
+      "in_domain_and_accepted_per_leg": 5528,
+      "call": {
+        "median": 0.0000234,
+        "p95": 0.0011672,
+        "p99": 0.0017998,
+        "maximum": 0.0029456,
+        "percent_within_0_001": 92.37
+      },
+      "put": {
+        "median": 0.0000279,
+        "p95": 0.0013621,
+        "p99": 0.0019915,
+        "maximum": 0.0027250,
+        "percent_within_0_001": 91.08
+      }
+    }
+  },
+  "agave_compute_campaign": {
+    "program_id": "BdR4cSgZGQgXNo33SZSYQXy7XgEK61sHT4NQaAkc3PBm",
+    "artifact_sha256": "685d49886179ca0bec80e31d9e9b878f3d044a47869cfd2f70cc2cf194c05161",
+    "artifact_bytes": 1083408,
+    "quotes_per_leg": 2000,
+    "call": {
+      "accepted": 2000,
+      "average_math_cu": 381096,
+      "median_math_cu": 382636,
+      "p95_math_cu": 387937,
+      "p99_math_cu": 388749,
+      "maximum_math_cu": 389587,
+      "maximum_full_instruction_cu": 390628
+    },
+    "put": {
+      "accepted": 2000,
+      "average_math_cu": 371876,
+      "median_math_cu": 382652,
+      "p95_math_cu": 387882,
+      "p99_math_cu": 388879,
+      "maximum_math_cu": 389742,
+      "maximum_full_instruction_cu": 390786
+    }
+  },
+  "isolated_sbf_footprint": {
+    "anchor_baseline_bytes": 184848,
+    "kbi_total_bytes": 293360,
+    "kbi_linked_delta_bytes": 108512
+  },
+  "full_feature_composite_after_closed_form_removal": {
+    "previous_bytes": 1040392,
+    "current_bytes": 1012056,
+    "bytes_removed": 28336,
+    "artifact_sha256": "077c562dfa3f41b9a1f7d05f6bc92ce1bd288897c657aca72929bd0147b24da7"
+  }
+}

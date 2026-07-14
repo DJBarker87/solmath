@@ -1,8 +1,8 @@
+use crate::arithmetic::{fp_div, fp_div_ceil, fp_mul};
 use crate::constants::SCALE;
 use crate::error::SolMathError;
-use crate::arithmetic::{fp_mul, fp_div};
-use crate::mul_div::mul_div_ceil_u128;
 use crate::hp::pow_fixed_hp;
+use crate::mul_div::mul_div_ceil_u128;
 
 /// Convert raw token amount (lamports/smallest unit) to fixed-point at SCALE (1e12).
 ///
@@ -24,7 +24,9 @@ pub fn token_to_fp(raw_amount: u64, token_decimals: u8) -> Result<u128, SolMathE
         return Err(SolMathError::DomainError);
     }
     if decimals <= 12 {
-        amount.checked_mul(10u128.pow(12 - decimals)).ok_or(SolMathError::Overflow)
+        amount
+            .checked_mul(10u128.pow(12 - decimals))
+            .ok_or(SolMathError::Overflow)
     } else {
         Ok(amount / 10u128.pow(decimals - 12))
     }
@@ -50,7 +52,9 @@ pub fn fp_to_token_floor(fp_amount: u128, token_decimals: u8) -> Result<u64, Sol
     let raw = if decimals <= 12 {
         fp_amount / 10u128.pow(12 - decimals)
     } else {
-        fp_amount.checked_mul(10u128.pow(decimals - 12)).ok_or(SolMathError::Overflow)?
+        fp_amount
+            .checked_mul(10u128.pow(decimals - 12))
+            .ok_or(SolMathError::Overflow)?
     };
     if raw > u64::MAX as u128 {
         return Err(SolMathError::Overflow);
@@ -80,13 +84,18 @@ pub fn fp_to_token_ceil(fp_amount: u128, token_decimals: u8) -> Result<u64, SolM
     let divisor = if decimals <= 12 {
         10u128.pow(12 - decimals)
     } else {
-        let raw = fp_amount.checked_mul(10u128.pow(decimals - 12)).ok_or(SolMathError::Overflow)?;
+        let raw = fp_amount
+            .checked_mul(10u128.pow(decimals - 12))
+            .ok_or(SolMathError::Overflow)?;
         if raw > u64::MAX as u128 {
             return Err(SolMathError::Overflow);
         }
         return Ok(raw as u64);
     };
-    let raw = fp_amount.checked_add(divisor - 1).ok_or(SolMathError::Overflow)? / divisor;
+    let raw = fp_amount
+        .checked_add(divisor - 1)
+        .ok_or(SolMathError::Overflow)?
+        / divisor;
     if raw > u64::MAX as u128 {
         return Err(SolMathError::Overflow);
     }
@@ -112,8 +121,12 @@ pub fn fp_to_token_ceil(fp_amount: u128, token_decimals: u8) -> Result<u64, SolM
 ///
 /// # Errors
 /// - `DivisionByZero` if `weight_out == 0`
-/// - `DomainError` if `weight_in == 0`, `balance_in == 0`, `balance_out == 0`, or `fee_rate > SCALE`
+/// - `DomainError` if a balance/input weight is zero, `fee_rate > SCALE`,
+///   the post-trade input balance ratio is below 1%, or the weight ratio exceeds 20
 /// - `Overflow` if `balance_in + amount_in` overflows or power computation fails
+///
+/// Every rounding step is directed against the trader. The power output is
+/// raised by its certified five-unit absolute error bound before payout.
 ///
 /// # Example
 /// ```
@@ -153,11 +166,27 @@ pub fn weighted_pool_swap(
     }
 
     // ratio = B_i / (B_i + a_in)
-    let denominator = balance_in.checked_add(amount_in).ok_or(SolMathError::Overflow)?;
-    let ratio = fp_div(balance_in, denominator)?;
+    let denominator = balance_in
+        .checked_add(amount_in)
+        .ok_or(SolMathError::Overflow)?;
+    let min_balance = denominator / 100 + u128::from(denominator % 100 != 0);
+    if balance_in < min_balance {
+        return Err(SolMathError::DomainError);
+    }
+    let weight_q = weight_in / weight_out;
+    if weight_q > 20 || (weight_q == 20 && weight_in % weight_out != 0) {
+        return Err(SolMathError::DomainError);
+    }
+    let ratio = fp_div_ceil(balance_in, denominator)?;
 
     // weight_ratio = w_i / w_j
     let weight_ratio = fp_div(weight_in, weight_out)?;
+
+    // The certified absolute error bound used below applies to this domain.
+    // Reject unsupported pool shapes rather than using an empirical margin.
+    if ratio < SCALE / 100 || weight_ratio > 20 * SCALE {
+        return Err(SolMathError::DomainError);
+    }
 
     // power = ratio ^ weight_ratio (using HP for precision)
     let power = pow_fixed_hp(ratio, weight_ratio)?;
@@ -168,9 +197,13 @@ pub fn weighted_pool_swap(
     if power > SCALE {
         return Err(SolMathError::Overflow);
     }
-    let one_minus_power = SCALE - power;
+    // Within ratio∈[0.01,1], exponent∈[0,20], and output≤1, Proposition 11's
+    // component-wise bound is 5 raw SCALE units. Move the result upward by
+    // that full bound so approximation error cannot favour the trader.
+    let power_up = power.checked_add(5).unwrap_or(SCALE).min(SCALE);
+    let one_minus_power = SCALE - power_up;
     // gross_out rounds DOWN (trader gets less) — protocol-favorable
-    let gross_out = fp_mul(balance_out, one_minus_power)?;
+    let gross_out = fp_mul(balance_out, one_minus_power)?.min(balance_out.saturating_sub(1));
 
     // fee rounds UP (protocol collects at least the fee) — protocol-favorable
     let fee = mul_div_ceil_u128(gross_out, fee_rate, SCALE)?;
@@ -183,4 +216,48 @@ pub fn weighted_pool_swap(
     let net_out = gross_out - fee;
 
     Ok((net_out, fee))
+}
+
+#[cfg(test)]
+mod adversarial_tests {
+    use super::*;
+
+    #[test]
+    fn swap_rounding_never_exceeds_exact_equal_weight_output() {
+        let (out, fee) =
+            weighted_pool_swap(SCALE, 3 * SCALE, SCALE / 2, SCALE / 2, 2 * SCALE, 0).unwrap();
+        assert_eq!(fee, 0);
+        assert!(out <= 2 * SCALE);
+    }
+
+    #[test]
+    fn rejects_outside_certified_power_domain() {
+        assert_eq!(
+            weighted_pool_swap(SCALE, SCALE, 21 * SCALE, SCALE, SCALE, 0),
+            Err(SolMathError::DomainError)
+        );
+        assert_eq!(
+            weighted_pool_swap(SCALE, SCALE, SCALE, SCALE, 100 * SCALE, 0),
+            Err(SolMathError::DomainError)
+        );
+    }
+
+    #[test]
+    fn exact_domain_checks_cannot_be_bypassed_by_fixed_rounding() {
+        assert_eq!(
+            weighted_pool_swap(100_000_000, SCALE, SCALE, SCALE, 9_900_000_001, 0,),
+            Err(SolMathError::DomainError)
+        );
+        assert_eq!(
+            weighted_pool_swap(
+                SCALE,
+                SCALE,
+                20_000_000_000_000_000_001,
+                1_000_000_000_000_000_000,
+                SCALE,
+                0,
+            ),
+            Err(SolMathError::DomainError)
+        );
+    }
 }

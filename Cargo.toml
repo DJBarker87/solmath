@@ -1,11 +1,12 @@
 [package]
 name = "solmath"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.79"
-description = "Fixed-point financial math for Solana. Black-Scholes, Greeks, IV, NIG pricing, pool math — pure integer arithmetic, no_std, zero dependencies."
+description = "Deterministic fixed-point math and quantitative finance for Solana: Greeks, IV, American KBI, NIG, TWAP, and DeFi primitives."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/DJBarker87/solmath"
+documentation = "https://docs.rs/solmath"
 keywords = ["solana", "fixed-point", "black-scholes", "defi", "math"]
 categories = ["mathematics", "no-std::no-alloc"]
 readme = "README.md"
@@ -13,24 +14,29 @@ include = [
     "Cargo.toml",
     "README.md",
     "INTEGRATION.md",
-    "SECURITY.md",
     "USAGE.md",
-    "PROOFS.md",
+    "SECURITY.md",
     "VALIDATION.md",
     "CHANGELOG.md",
     "LICENSE-APACHE",
     "LICENSE-MIT",
-    "docs/**",
-    "examples/**",
-    "benchmark/iv_vectors.json",
-    "test_data/heston_reference_tests.rs",
-    "test_data/sabr_reference_tests.rs",
+    "docs/ARCHITECTURE.md",
+    "docs/AMERICAN_KBI.md",
+    "docs/ASIAN_TWAP.md",
+    "docs/NIG.md",
+    "examples/*.rs",
+    "!examples/README.md",
     "src/**",
 ]
 
 [features]
-default = ["transcendental", "complex"]
-full = ["transcendental", "complex", "bs", "iv", "barrier", "nig", "heston", "sabr", "pool", "bivariate"]
+# Keep the default useful for general fixed-point clients without linking any
+# pricing model or the niche complex-arithmetic surface into downstream SBF
+# programs. Every model remains an explicit capability.
+default = ["transcendental"]
+# Stable runtime capabilities only. Offline table generation and the alternate
+# Padé IV path intentionally remain explicit opt-ins.
+full = ["transcendental", "complex", "bs", "iv", "barrier", "asian", "nig", "heston", "sabr", "pool", "bivariate", "american-kbi", "rainbow"]
 transcendental = []
 bivariate = ["transcendental"]
 table-gen = ["bivariate"]
@@ -38,15 +44,38 @@ complex = ["transcendental"]
 bs = ["transcendental"]
 iv = ["bs"]
 barrier = ["transcendental"]
-nig = ["transcendental", "complex"]
-heston = ["bs", "complex"]
+# Continuous arithmetic-Asian / partially fixed TWAP settlement pricing.
+asian = ["transcendental"]
+# Kim Boundary Integration: a nonlinear smooth-pasting exercise boundary plus
+# Kim's early-exercise-premium integral, evaluated entirely in the program.
+american-kbi = ["transcendental"]
+# Two-asset rainbow options (worst-of / best-of) via bivariate normal CDF.
+rainbow = ["bivariate"]
+# Exponential NIG pricing uses the crate's fixed-point exp/log kernels.
+nig = ["transcendental"]
+heston = ["bs"]
 sabr = ["transcendental"]
 pool = ["transcendental"]
 pade-iv = ["iv"]
-idl-build = []
 
 [dependencies]
 # Zero dependencies — pure Rust, no_std
+
+[package.metadata.docs.rs]
+all-features = true
+targets = ["x86_64-unknown-linux-gnu"]
+
+[lints.rust]
+# Kani injects its proof API only while `cargo kani` is compiling the crate.
+# Declaring the cfg keeps modern rustc check-cfg output actionable without
+# adding a runtime or development dependency.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+# Defense in depth for this repository's own release/SBF builds. Cargo ignores
+# dependency profile settings, so downstream Solana programs must set this too
+# in their workspace root (see INTEGRATION.md).
+[profile.release]
+overflow-checks = true
 
 [[example]]
 name = "options_pricing"
@@ -59,6 +88,26 @@ path = "examples/weighted_pool_swap.rs"
 required-features = ["pool"]
 
 [[example]]
+name = "nig_batch"
+path = "examples/nig_batch.rs"
+required-features = ["nig"]
+
+[[example]]
 name = "safe_token_conversion"
 path = "examples/safe_token_conversion.rs"
 required-features = ["pool"]
+
+[[example]]
+name = "american_kbi_batch"
+path = "examples/american_kbi_batch.rs"
+required-features = ["american-kbi"]
+
+[[example]]
+name = "twap_options"
+path = "examples/twap_options.rs"
+required-features = ["asian"]
+
+[[example]]
+name = "asian_batch"
+path = "examples/asian_batch.rs"
+required-features = ["asian"]

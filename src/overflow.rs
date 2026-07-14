@@ -1,7 +1,9 @@
-use crate::constants::{U256, MulDivRounding};
+use crate::constants::{MulDivRounding, U256};
 use crate::error::SolMathError;
 
-/// U256 long division. Internal — fallback for checked_mul_div_rem_u.
+/// U256 long division reference used to cross-check optimized division in
+/// this crate's own tests. It is intentionally absent from on-chain builds.
+#[cfg(test)]
 #[inline]
 pub(crate) fn div_rem_u256_long(numerator: U256, divisor: U256) -> (U256, U256) {
     let mut rem = U256::zero();
@@ -46,6 +48,7 @@ pub(crate) fn checked_mul_div_rem_u(a: u128, b: u128, c: u128) -> Option<(u128, 
         return None;
     }
 
+    #[cfg(test)]
     debug_assert_eq!(
         (quo, U256::from_u128(rem)),
         div_rem_u256_long(numerator, U256::from_u128(c))
@@ -62,7 +65,12 @@ pub(crate) fn checked_mul_div_u(a: u128, b: u128, c: u128) -> Option<u128> {
 
 /// Overflow-safe signed (a × b) / c with configurable rounding. Internal.
 #[inline]
-pub(crate) fn checked_mul_div_round_i(a: i128, b: i128, c: i128, rounding: MulDivRounding) -> Result<i128, SolMathError> {
+pub(crate) fn checked_mul_div_round_i(
+    a: i128,
+    b: i128,
+    c: i128,
+    rounding: MulDivRounding,
+) -> Result<i128, SolMathError> {
     if c == 0 {
         return Err(SolMathError::DivisionByZero);
     }
@@ -79,8 +87,12 @@ pub(crate) fn checked_mul_div_round_i(a: i128, b: i128, c: i128, rounding: MulDi
     if rem != 0 {
         match rounding {
             MulDivRounding::ToZero => {}
-            MulDivRounding::Floor if neg => mag = mag.checked_add(1).ok_or(SolMathError::Overflow)?,
-            MulDivRounding::Ceil if !neg => mag = mag.checked_add(1).ok_or(SolMathError::Overflow)?,
+            MulDivRounding::Floor if neg => {
+                mag = mag.checked_add(1).ok_or(SolMathError::Overflow)?
+            }
+            MulDivRounding::Ceil if !neg => {
+                mag = mag.checked_add(1).ok_or(SolMathError::Overflow)?
+            }
             _ => {}
         }
     }

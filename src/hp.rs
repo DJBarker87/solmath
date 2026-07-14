@@ -1,10 +1,9 @@
+use crate::arithmetic::{fp_mul, fp_mul_i, fp_sqrt, isqrt_u128};
 use crate::constants::*;
 use crate::double_word::DoubleWord;
 use crate::error::SolMathError;
-use crate::arithmetic::{fp_mul, fp_mul_i, fp_sqrt, isqrt_u128};
 use crate::overflow::{checked_mul_div_i, checked_mul_div_u};
 use crate::transcendental::exp_fixed_i;
-
 
 /// Unsigned high-precision fixed-point multiply at `SCALE_HP` (1e15).
 ///
@@ -19,16 +18,26 @@ pub fn fp_mul_hp_u(a: u128, b: u128) -> Result<u128, SolMathError> {
     let hi_b = b / SCALE_HP_U;
     let lo_b = b % SCALE_HP_U;
 
-    let hh = hi_a.checked_mul(hi_b).ok_or(SolMathError::Overflow)?
-        .checked_mul(SCALE_HP_U).ok_or(SolMathError::Overflow)?;
+    let hh = hi_a
+        .checked_mul(hi_b)
+        .ok_or(SolMathError::Overflow)?
+        .checked_mul(SCALE_HP_U)
+        .ok_or(SolMathError::Overflow)?;
     let hl = hi_a.checked_mul(lo_b).ok_or(SolMathError::Overflow)?;
     let lh = lo_a.checked_mul(hi_b).ok_or(SolMathError::Overflow)?;
-    let ll = lo_a.checked_mul(lo_b).ok_or(SolMathError::Overflow)?
-        .checked_add(SCALE_HP_U / 2).ok_or(SolMathError::Overflow)? / SCALE_HP_U;
+    let ll = lo_a
+        .checked_mul(lo_b)
+        .ok_or(SolMathError::Overflow)?
+        .checked_add(SCALE_HP_U / 2)
+        .ok_or(SolMathError::Overflow)?
+        / SCALE_HP_U;
 
-    hh.checked_add(hl).ok_or(SolMathError::Overflow)?
-        .checked_add(lh).ok_or(SolMathError::Overflow)?
-        .checked_add(ll).ok_or(SolMathError::Overflow)
+    hh.checked_add(hl)
+        .ok_or(SolMathError::Overflow)?
+        .checked_add(lh)
+        .ok_or(SolMathError::Overflow)?
+        .checked_add(ll)
+        .ok_or(SolMathError::Overflow)
 }
 
 /// Signed high-precision fixed-point multiply at `SCALE_HP` (1e15).
@@ -74,11 +83,14 @@ pub(crate) fn fp_mul_hp_fast(a: i128, b: i128) -> i128 {
 /// - **b**: signed denominator at 1e15 scale. Must be non-zero.
 /// - **Returns**: `i128` at 1e15 scale.
 /// - **Errors**: `DivisionByZero` if `b == 0`, `Overflow` if the scaled quotient exceeds `i128`.
-/// - **Accuracy**: exact to rounding.
+/// - **Rounding**: exact truncation toward zero.
 #[inline]
 pub fn fp_div_hp_safe(a: i128, b: i128) -> Result<i128, SolMathError> {
     if b == 0 {
         return Err(SolMathError::DivisionByZero);
+    }
+    if a == i128::MIN && b == -1 {
+        return Err(SolMathError::Overflow);
     }
 
     let q = a / b;
@@ -164,8 +176,7 @@ pub fn ln_fixed_hp(x: i128) -> Result<i128, SolMathError> {
     let q = p / t_den;
     let r = p % t_den;
     // t_den ∈ (SCALE_HP, 3·SCALE_HP), half_den ≤ 1.5·SCALE_HP, fits i128.
-    let half_den = t_den / 2;
-    let (t, t_lo) = if r >= half_den {
+    let (t, t_lo) = if r >= t_den - r {
         // r - t_den ∈ (-t_den, 0); (r - t_den) * SCALE_HP: |product| < 3e30, fits i128.
         // r * SCALE_HP: r < t_den < 3e15, product < 3e30, fits i128.
         (q + 1, (r - t_den) * SCALE_HP / t_den)
@@ -230,9 +241,15 @@ pub fn ln_fixed_hp(x: i128) -> Result<i128, SolMathError> {
 pub fn exp_fixed_hp(x: i128) -> Result<i128, SolMathError> {
     let max_x = 40 * SCALE_HP;
 
-    if x <= -max_x { return Ok(0); }
-    if x >= max_x { return Err(SolMathError::Overflow); }
-    if x == 0 { return Ok(SCALE_HP); }
+    if x <= -max_x {
+        return Ok(0);
+    }
+    if x >= max_x {
+        return Err(SolMathError::Overflow);
+    }
+    if x == 0 {
+        return Ok(SCALE_HP);
+    }
 
     // Split LN2: LN2_HP undershoots (LN2_HP_LO > 0), so k*LN2_HP is too small
     // and r = x - k*LN2_HP is too large. Subtract the positive correction.
@@ -241,14 +258,23 @@ pub fn exp_fixed_hp(x: i128) -> Result<i128, SolMathError> {
     let ln2_correction = {
         // k ∈ (-58, 58), LN2_HP_LO ≈ 3e14; k * LN2_HP_LO ≤ 58 * 3e14 ≈ 1.7e16, fits i128.
         let raw = k * LN2_HP_LO;
-        if raw >= 0 { (raw + SCALE_HP / 2) / SCALE_HP } else { (raw - SCALE_HP / 2) / SCALE_HP }
+        if raw >= 0 {
+            (raw + SCALE_HP / 2) / SCALE_HP
+        } else {
+            (raw - SCALE_HP / 2) / SCALE_HP
+        }
     };
     // k * LN2_HP ≤ 58 * 6.9e14 ≈ 4e16; x ≤ 40·SCALE_HP = 4e16; r ∈ (-2·SCALE_HP, 2·SCALE_HP), fits i128.
     let mut r = x - k * LN2_HP - ln2_correction;
 
     // r ∈ (-2·SCALE_HP, 2·SCALE_HP); LN2_HP ≈ 6.9e14; r ± LN2_HP ∈ (-3·SCALE_HP, 3·SCALE_HP), fits i128.
-    if r > HALF_LN2_HP { k += 1; r -= LN2_HP; }
-    else if r < -HALF_LN2_HP { k -= 1; r += LN2_HP; }
+    if r > HALF_LN2_HP {
+        k += 1;
+        r -= LN2_HP;
+    } else if r < -HALF_LN2_HP {
+        k -= 1;
+        r += LN2_HP;
+    }
 
     let xx = fp_mul_hp_fast(r, r);
 
@@ -310,41 +336,44 @@ pub fn pow_fixed_hp(base: u128, exponent: u128) -> Result<u128, SolMathError> {
     }
 
     let base_hp = upscale_std_to_hp(base)?;
-    let exp_hp = upscale_std_to_hp(exponent)?;
+    let exp_hp = match upscale_std_to_hp(exponent) {
+        Ok(v) => v,
+        Err(SolMathError::Overflow) if base < SCALE => return Ok(0),
+        Err(e) => return Err(e),
+    };
     let ln_base = ln_fixed_hp(base_hp)?;
-    let product = fp_mul_hp_i(exp_hp, ln_base)?;
+    let product = match fp_mul_hp_i(exp_hp, ln_base) {
+        Ok(v) => v,
+        Err(SolMathError::Overflow) if base < SCALE => return Ok(0),
+        Err(e) => return Err(e),
+    };
 
     // Fast path: product fits in exp_fixed_hp's range
-    if product.abs() < 39 * SCALE_HP {
+    if product.unsigned_abs() < (39 * SCALE_HP) as u128 {
         let result_hp = exp_fixed_hp(product)?;
         return Ok(downscale_hp_to_std(result_hp));
     }
 
     // Split path: decompose exponent into integer + fractional parts.
-    let n = (exponent / SCALE) as u32;
     let frac_std = exponent % SCALE;
 
     let mut int_result: u128 = SCALE;
     let mut pow_base: u128 = base;
-    let mut remaining = n;
+    let mut remaining = exponent / SCALE;
     while remaining > 0 {
         if remaining & 1 == 1 {
             int_result = match checked_mul_div_u(int_result, pow_base, SCALE) {
-                Some(v) if v > 0 => v,
-                _ => return Ok(0),
+                Some(0) => return Ok(0),
+                Some(v) => v,
+                None => return Err(SolMathError::Overflow),
             };
         }
         remaining >>= 1;
         if remaining > 0 {
             pow_base = match checked_mul_div_u(pow_base, pow_base, SCALE) {
-                Some(v) if v > 0 => v,
-                _ => {
-                    if base < SCALE {
-                        return Ok(0);
-                    } else {
-                        return Err(SolMathError::Overflow);
-                    }
-                }
+                Some(0) => return Ok(0),
+                Some(v) => v,
+                None => return Err(SolMathError::Overflow),
             };
         }
     }
@@ -360,13 +389,7 @@ pub fn pow_fixed_hp(base: u128, exponent: u128) -> Result<u128, SolMathError> {
 
     match checked_mul_div_u(int_result, frac_result, SCALE) {
         Some(v) => Ok(v),
-        None => {
-            if base < SCALE {
-                Ok(0)
-            } else {
-                Err(SolMathError::Overflow)
-            }
-        }
+        None => Err(SolMathError::Overflow),
     }
 }
 
@@ -556,17 +579,15 @@ pub fn norm_cdf_poly_hp(x: i128) -> Result<i128, SolMathError> {
     let cdf_pos = cdf_pos.clamp(0, SCALE_HP);
 
     // cdf_pos ∈ [0, SCALE_HP] after clamp; SCALE_HP - cdf_pos ∈ [0, SCALE_HP], fits i128.
-    Ok(if x >= 0 {
-        cdf_pos
-    } else {
-        SCALE_HP - cdf_pos
-    })
+    Ok(if x >= 0 { cdf_pos } else { SCALE_HP - cdf_pos })
 }
 
 /// Map |x| to local Chebyshev variable t at HP scale. Internal — called by norm_cdf_poly_hp.
 #[inline]
 pub(crate) fn poly_map_t_hp(ax: i128, mid: i128, hw: i128) -> Result<i128, SolMathError> {
-    let product = (ax - mid).checked_mul(SCALE_HP).ok_or(SolMathError::Overflow)?;
+    let product = (ax - mid)
+        .checked_mul(SCALE_HP)
+        .ok_or(SolMathError::Overflow)?;
     Ok(product / hw)
 }
 
@@ -580,7 +601,6 @@ pub(crate) struct BsIntermediatesHp {
     pub d2_hp: i128,
     pub phi_d1_hp: i128,
     pub phi_d2_hp: i128,
-    pub phi_neg_d1_hp: i128,
     pub phi_neg_d2_hp: i128,
     pub k_disc_hp: i128,
     pub sigma_sqrt_t_hp: i128,
@@ -592,7 +612,11 @@ pub(crate) struct BsIntermediatesHp {
 
 /// Compute HP Black-Scholes intermediates shared between price-only and full Greeks.
 pub(crate) fn compute_bs_intermediates_hp(
-    s: u128, k: u128, r: u128, sigma: u128, t: u128,
+    s: u128,
+    k: u128,
+    r: u128,
+    sigma: u128,
+    t: u128,
 ) -> Result<BsIntermediatesHp, SolMathError> {
     let s_hp = upscale_std_to_hp(s)?;
     let k_hp = upscale_std_to_hp(k)?;
@@ -600,7 +624,11 @@ pub(crate) fn compute_bs_intermediates_hp(
     let sigma_hp = upscale_std_to_hp(sigma)?;
     let t_hp = upscale_std_to_hp(t)?;
 
-    let sqrt_t_hp = isqrt_u128((t_hp as u128).checked_mul(SCALE_HP_U).ok_or(SolMathError::Overflow)?) as i128;
+    let sqrt_t_hp = isqrt_u128(
+        (t_hp as u128)
+            .checked_mul(SCALE_HP_U)
+            .ok_or(SolMathError::Overflow)?,
+    ) as i128;
     let sigma_sqrt_t_hp = fp_mul_hp_i(sigma_hp, sqrt_t_hp)?;
 
     let sk_ratio_hp = fp_div_hp_safe(s_hp, k_hp)?;
@@ -609,9 +637,14 @@ pub(crate) fn compute_bs_intermediates_hp(
     // sigma_sq_half_hp: fp_mul_hp_i is checked; /2: ∈ [0, SCALE_HP/2], fits i128.
     let sigma_sq_half_hp = fp_mul_hp_i(sigma_hp, sigma_hp)? / 2;
     // r_hp ∈ [0, SCALE_HP], sigma_sq_half_hp ∈ [0, SCALE_HP/2]: sum ≤ 1.5·SCALE_HP, fits i128.
-    let drift_hp = fp_mul_hp_i(r_hp + sigma_sq_half_hp, t_hp)?;
+    let drift_rate_hp = r_hp
+        .checked_add(sigma_sq_half_hp)
+        .ok_or(SolMathError::Overflow)?;
+    let drift_hp = fp_mul_hp_i(drift_rate_hp, t_hp)?;
     // ln_sk_hp ∈ [-40·SCALE_HP, 40·SCALE_HP], drift_hp ∈ [-SCALE_HP, SCALE_HP]; sum fits i128.
-    let d1_num_hp = ln_sk_hp + drift_hp;
+    let d1_num_hp = ln_sk_hp
+        .checked_add(drift_hp)
+        .ok_or(SolMathError::Overflow)?;
 
     let d1_hp = if sigma_sqrt_t_hp > 0 {
         fp_div_hp_safe(d1_num_hp, sigma_sqrt_t_hp)?
@@ -620,12 +653,13 @@ pub(crate) fn compute_bs_intermediates_hp(
     };
     // d1_hp ∈ [-8·SCALE_HP, 8·SCALE_HP] (clamped by norm_cdf_poly_hp); sigma_sqrt_t_hp ∈ [0, ~SCALE_HP];
     // d2_hp = d1_hp - sigma_sqrt_t_hp ∈ [-9·SCALE_HP, 8·SCALE_HP], fits i128.
-    let d2_hp = d1_hp - sigma_sqrt_t_hp;
+    let d2_hp = d1_hp
+        .checked_sub(sigma_sqrt_t_hp)
+        .ok_or(SolMathError::Overflow)?;
 
     let phi_d1_hp = norm_cdf_poly_hp(d1_hp)?;
     let phi_d2_hp = norm_cdf_poly_hp(d2_hp)?;
     // phi_d1_hp, phi_d2_hp ∈ [0, SCALE_HP]; SCALE_HP - phi ∈ [0, SCALE_HP], fits i128.
-    let phi_neg_d1_hp = SCALE_HP - phi_d1_hp;
     let phi_neg_d2_hp = SCALE_HP - phi_d2_hp;
 
     let r_t_hp = fp_mul_hp_i(r_hp, t_hp)?;
@@ -633,17 +667,26 @@ pub(crate) fn compute_bs_intermediates_hp(
     let k_disc_hp = fp_mul_hp_i(k_hp, discount_hp)?;
 
     Ok(BsIntermediatesHp {
-        s_hp, k_hp, d1_hp, d2_hp,
-        phi_d1_hp, phi_d2_hp, phi_neg_d1_hp, phi_neg_d2_hp,
-        k_disc_hp, sigma_sqrt_t_hp, sqrt_t_hp,
-        sigma_hp, r_hp, t_hp,
+        s_hp,
+        k_hp,
+        d1_hp,
+        d2_hp,
+        phi_d1_hp,
+        phi_d2_hp,
+        phi_neg_d2_hp,
+        k_disc_hp,
+        sigma_sqrt_t_hp,
+        sqrt_t_hp,
+        sigma_hp,
+        r_hp,
+        t_hp,
     })
 }
 
 /// High-precision Black-Scholes call and put prices (no Greeks).
 ///
 /// Accepts and returns values at `SCALE` (1e12) but computes internally at `SCALE_HP` (1e15).
-/// ~60K CU on Solana.
+/// Final SBF audit: 84,528 CU average, 83,535 median, 122,380 max.
 ///
 /// - **s**: spot price at `SCALE`.
 /// - **k**: strike price at `SCALE`.
@@ -654,10 +697,17 @@ pub(crate) fn compute_bs_intermediates_hp(
 /// - **Errors**: `DomainError` if `sigma == 0` or `t == 0`.
 /// - **Accuracy**: 3-4 ULP max.
 pub fn black_scholes_price_hp(
-    s: u128, k: u128, r: u128, sigma: u128, t: u128,
+    s: u128,
+    k: u128,
+    r: u128,
+    sigma: u128,
+    t: u128,
 ) -> Result<(u128, u128), SolMathError> {
-    if s > i128::MAX as u128 || k > i128::MAX as u128 || r > i128::MAX as u128
-        || sigma > i128::MAX as u128 || t > i128::MAX as u128
+    if s > i128::MAX as u128
+        || k > i128::MAX as u128
+        || r > i128::MAX as u128
+        || sigma > i128::MAX as u128
+        || t > i128::MAX as u128
     {
         return Err(SolMathError::Overflow);
     }
@@ -680,9 +730,10 @@ pub fn black_scholes_price_hp(
     // fp_mul_hp_i terms are checked; s_hp and k_disc_hp are SCALE_HP prices, phi values ∈ [0, SCALE_HP];
     // each product ≤ SCALE_HP; differences ∈ (-SCALE_HP, SCALE_HP), fits i128.
     let call_hp = fp_mul_hp_i(im.s_hp, im.phi_d1_hp)? - fp_mul_hp_i(im.k_disc_hp, im.phi_d2_hp)?;
-    let put_hp = fp_mul_hp_i(im.k_disc_hp, im.phi_neg_d2_hp)? - fp_mul_hp_i(im.s_hp, im.phi_neg_d1_hp)?;
-    let call = downscale_hp_to_std(call_hp);
-    let put = downscale_hp_to_std(put_hp);
+    let call_std = downscale_hp_to_std(call_hp);
+    let k_disc_std = downscale_hp_to_std_i(im.k_disc_hp);
+    let (call, put) =
+        crate::arithmetic::european_prices_from_call(call_std as i128, s, k_disc_std)?;
 
     Ok((call, put))
 }
@@ -701,6 +752,7 @@ pub fn black_scholes_price_hp(
 /// - **Errors**: `DomainError` if `sigma == 0` or `t == 0`.
 /// - **Accuracy**: call/put 3-4 ULP max, ~74% exact. Gamma 1 ULP max, 100% exact.
 ///   Delta 1 ULP max, 99.9% exact.
+/// - **CU**: final SBF audit 113,177 average, 112,816 median, 149,925 max.
 ///
 /// # Example
 /// ```
@@ -712,8 +764,11 @@ pub fn black_scholes_price_hp(
 /// # Ok::<(), solmath::SolMathError>(())
 /// ```
 pub fn bs_full_hp(s: u128, k: u128, r: u128, sigma: u128, t: u128) -> Result<BsFull, SolMathError> {
-    if s > i128::MAX as u128 || k > i128::MAX as u128 || r > i128::MAX as u128
-        || sigma > i128::MAX as u128 || t > i128::MAX as u128
+    if s > i128::MAX as u128
+        || k > i128::MAX as u128
+        || r > i128::MAX as u128
+        || sigma > i128::MAX as u128
+        || t > i128::MAX as u128
     {
         return Err(SolMathError::Overflow);
     }
@@ -722,16 +777,34 @@ pub fn bs_full_hp(s: u128, k: u128, r: u128, sigma: u128, t: u128) -> Result<BsF
     }
 
     if s == 0 || k == 0 {
+        let (put_theta, put_rho) = if s == 0 {
+            let r_t = fp_mul_i(r as i128, t as i128)?;
+            let kd = fp_mul_i(k as i128, exp_fixed_i(-r_t)?)?;
+            (fp_mul_i(r as i128, kd)?, -fp_mul_i(t as i128, kd)?)
+        } else {
+            (0, 0)
+        };
         let zero_full = BsFull {
             call: if s > 0 { s } else { 0 },
             put: if s == 0 {
                 let r_t = fp_mul_i(r as i128, t as i128)?;
                 let kd = fp_mul_i(k as i128, exp_fixed_i(-r_t)?)?;
-                if kd > 0 { kd as u128 } else { 0 }
-            } else { 0 },
+                if kd > 0 {
+                    kd as u128
+                } else {
+                    0
+                }
+            } else {
+                0
+            },
             call_delta: if s == 0 { 0 } else { SCALE_I },
             put_delta: if s == 0 { -SCALE_I } else { 0 },
-            gamma: 0, vega: 0, call_theta: 0, put_theta: 0, call_rho: 0, put_rho: 0,
+            gamma: 0,
+            vega: 0,
+            call_theta: 0,
+            put_theta,
+            call_rho: 0,
+            put_rho,
         };
         return Ok(zero_full);
     }
@@ -746,9 +819,10 @@ pub fn bs_full_hp(s: u128, k: u128, r: u128, sigma: u128, t: u128) -> Result<BsF
     // fp_mul_hp_i terms are checked; s_hp and k_disc_hp are SCALE_HP prices; phi values ∈ [0, SCALE_HP];
     // products ≤ SCALE_HP; difference ∈ (-SCALE_HP, SCALE_HP), fits i128.
     let call_hp = fp_mul_hp_i(im.s_hp, im.phi_d1_hp)? - fp_mul_hp_i(im.k_disc_hp, im.phi_d2_hp)?;
-    let put_hp = fp_mul_hp_i(im.k_disc_hp, im.phi_neg_d2_hp)? - fp_mul_hp_i(im.s_hp, im.phi_neg_d1_hp)?;
-    let call = downscale_hp_to_std(call_hp);
-    let put = downscale_hp_to_std(put_hp);
+    let call_std = downscale_hp_to_std(call_hp);
+    let k_disc_std = downscale_hp_to_std_i(im.k_disc_hp);
+    let (call, put) =
+        crate::arithmetic::european_prices_from_call(call_std as i128, s, k_disc_std)?;
 
     let phi_d1_std = downscale_hp_to_std_i(im.phi_d1_hp);
     let call_delta = phi_d1_std;
@@ -769,7 +843,7 @@ pub fn bs_full_hp(s: u128, k: u128, r: u128, sigma: u128, t: u128) -> Result<BsF
     let spd_sigma_hp = fp_mul_hp_i(fp_mul_hp_i(im.s_hp, pdf_d1_hp)?, im.sigma_hp)?;
     // im.sqrt_t_hp = isqrt(t_hp * SCALE_HP); for t ≤ SCALE (1 year), sqrt_t_hp ≤ SCALE_HP;
     // 2 * im.sqrt_t_hp ≤ 2·SCALE_HP = 2e15, fits i128.
-    let two_sqrt_t_hp = 2 * im.sqrt_t_hp;
+    let two_sqrt_t_hp = im.sqrt_t_hp.checked_mul(2).ok_or(SolMathError::Overflow)?;
     let theta_common_hp = if two_sqrt_t_hp > 0 {
         -fp_div_hp_safe(spd_sigma_hp, two_sqrt_t_hp)?
     } else {
@@ -831,7 +905,10 @@ pub(crate) fn horner_compensated_hp(coeffs: &[i128], t: i128) -> Result<i128, So
 }
 
 /// Compensated Horner at HP scale returning DoubleWord for downstream propagation.
-pub(crate) fn horner_compensated_hp_dw(coeffs: &[i128], t: i128) -> Result<DoubleWord, SolMathError> {
+pub(crate) fn horner_compensated_hp_dw(
+    coeffs: &[i128],
+    t: i128,
+) -> Result<DoubleWord, SolMathError> {
     let n = coeffs.len();
     if n <= 1 {
         return Ok(DoubleWord::from_hi(if n == 1 { coeffs[0] } else { 0 }));
@@ -846,8 +923,7 @@ pub(crate) fn horner_compensated_hp_dw(coeffs: &[i128], t: i128) -> Result<Doubl
         // sum ∈ (-a few ×SCALE_HP, a few ×SCALE_HP), fits i128.
         s = dw.hi() + coeffs[i];
 
-        let comp_propagated = comp.checked_mul(t)
-            .ok_or(SolMathError::Overflow)? / SCALE_HP;
+        let comp_propagated = comp.checked_mul(t).ok_or(SolMathError::Overflow)? / SCALE_HP;
 
         // comp_propagated and dw.lo are both sub-ULP residuals with |value| < SCALE_HP;
         // sum ∈ (-2·SCALE_HP, 2·SCALE_HP), fits i128.
@@ -860,7 +936,39 @@ pub(crate) fn horner_compensated_hp_dw(coeffs: &[i128], t: i128) -> Result<Doubl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::{SCALE_HP, LN_REMEZ_HP_COEFFS};
+
+    #[test]
+    fn fp_div_hp_rejects_signed_division_overflow() {
+        assert_eq!(fp_div_hp_safe(i128::MIN, -1), Err(SolMathError::Overflow));
+    }
+
+    #[test]
+    fn pow_fixed_hp_reports_integer_path_overflow() {
+        assert_eq!(
+            pow_fixed_hp(2 * SCALE, 128 * SCALE),
+            Err(SolMathError::Overflow)
+        );
+    }
+
+    #[test]
+    fn pow_fixed_hp_does_not_truncate_integer_exponent_to_u32() {
+        let exponent = (u32::MAX as u128 + 1) * SCALE;
+        assert_eq!(
+            pow_fixed_hp(2 * SCALE, exponent),
+            Err(SolMathError::Overflow)
+        );
+        assert_eq!(pow_fixed_hp(SCALE / 2, exponent), Ok(0));
+    }
+
+    #[test]
+    fn black_scholes_hp_extreme_drift_returns_error_not_wrapped_price() {
+        let r = 170_141_183_460_469_231_731_687_303_715_884_105u128;
+        assert_eq!(
+            black_scholes_price_hp(SCALE, SCALE, r, SCALE, SCALE),
+            Err(SolMathError::Overflow)
+        );
+    }
+    use crate::constants::{LN_REMEZ_HP_COEFFS, SCALE_HP};
 
     // ===== fp_mul_hp_fast_dw tests =====
 
@@ -891,24 +999,43 @@ mod tests {
     #[test]
     fn test_hp_dw_consistency_with_fp_mul_hp_fast() {
         let values: &[i128] = &[
-            1, -1, 2, -2,
-            SCALE_HP / 2, -SCALE_HP / 2,
-            SCALE_HP, -SCALE_HP,
-            SCALE_HP + 1, -(SCALE_HP + 1),
-            SCALE_HP * 2, -(SCALE_HP * 2),
-            SCALE_HP / 3, -(SCALE_HP / 3),
-            SCALE_HP / 7, -(SCALE_HP / 7),
-            SCALE_HP * 50, -(SCALE_HP * 50),
-            999_999_999_999_999, -999_999_999_999_999,
-            500_000_000_000_001, -500_000_000_000_001,
+            1,
+            -1,
+            2,
+            -2,
+            SCALE_HP / 2,
+            -SCALE_HP / 2,
+            SCALE_HP,
+            -SCALE_HP,
+            SCALE_HP + 1,
+            -(SCALE_HP + 1),
+            SCALE_HP * 2,
+            -(SCALE_HP * 2),
+            SCALE_HP / 3,
+            -(SCALE_HP / 3),
+            SCALE_HP / 7,
+            -(SCALE_HP / 7),
+            SCALE_HP * 50,
+            -(SCALE_HP * 50),
+            999_999_999_999_999,
+            -999_999_999_999_999,
+            500_000_000_000_001,
+            -500_000_000_000_001,
         ];
         for &a in values {
             for &b in values {
                 if a.checked_mul(b).is_some() {
                     let expected = fp_mul_hp_fast(a, b);
                     let dw = fp_mul_hp_fast_dw(a, b);
-                    assert_eq!(dw.hi(), expected,
-                        "hi mismatch: a={}, b={}, expected={}, got={}", a, b, expected, dw.hi());
+                    assert_eq!(
+                        dw.hi(),
+                        expected,
+                        "hi mismatch: a={}, b={}, expected={}, got={}",
+                        a,
+                        b,
+                        expected,
+                        dw.hi()
+                    );
                 }
             }
         }
@@ -917,14 +1044,27 @@ mod tests {
     #[test]
     fn test_hp_dw_residual_bounded() {
         let values: &[i128] = &[
-            0, 1, -1, SCALE_HP, -SCALE_HP, SCALE_HP / 3, -SCALE_HP / 7,
-            SCALE_HP * 50, -SCALE_HP * 50, 999_999_999_999_999,
+            0,
+            1,
+            -1,
+            SCALE_HP,
+            -SCALE_HP,
+            SCALE_HP / 3,
+            -SCALE_HP / 7,
+            SCALE_HP * 50,
+            -SCALE_HP * 50,
+            999_999_999_999_999,
         ];
         for &a in values {
             for &b in values {
                 let dw = fp_mul_hp_fast_dw(a, b);
-                assert!(dw.lo().abs() < SCALE_HP,
-                    "lo out of bounds: a={}, b={}, lo={}", a, b, dw.lo());
+                assert!(
+                    dw.lo().abs() < SCALE_HP,
+                    "lo out of bounds: a={}, b={}, lo={}",
+                    a,
+                    b,
+                    dw.lo()
+                );
             }
         }
     }
@@ -957,15 +1097,24 @@ mod tests {
     #[test]
     fn test_horner_hp_constant() {
         let coeffs = [42 * SCALE_HP];
-        assert_eq!(horner_compensated_hp(&coeffs, SCALE_HP).unwrap(), 42 * SCALE_HP);
+        assert_eq!(
+            horner_compensated_hp(&coeffs, SCALE_HP).unwrap(),
+            42 * SCALE_HP
+        );
         assert_eq!(horner_compensated_hp(&coeffs, 0).unwrap(), 42 * SCALE_HP);
-        assert_eq!(horner_compensated_hp(&coeffs, -SCALE_HP).unwrap(), 42 * SCALE_HP);
+        assert_eq!(
+            horner_compensated_hp(&coeffs, -SCALE_HP).unwrap(),
+            42 * SCALE_HP
+        );
     }
 
     #[test]
     fn test_horner_hp_linear() {
         let coeffs = [5 * SCALE_HP, 3 * SCALE_HP];
-        assert_eq!(horner_compensated_hp(&coeffs, 2 * SCALE_HP).unwrap(), 11 * SCALE_HP);
+        assert_eq!(
+            horner_compensated_hp(&coeffs, 2 * SCALE_HP).unwrap(),
+            11 * SCALE_HP
+        );
     }
 
     #[test]
@@ -977,7 +1126,10 @@ mod tests {
     #[test]
     fn test_horner_hp_exact_quadratic() {
         let coeffs = [SCALE_HP, 2 * SCALE_HP, 3 * SCALE_HP];
-        assert_eq!(horner_compensated_hp(&coeffs, SCALE_HP).unwrap(), 6 * SCALE_HP);
+        assert_eq!(
+            horner_compensated_hp(&coeffs, SCALE_HP).unwrap(),
+            6 * SCALE_HP
+        );
     }
 
     #[test]
@@ -993,8 +1145,14 @@ mod tests {
 
             let compensated = horner_compensated_hp(&coeffs[..], u).unwrap();
             let diff = (compensated - r).abs();
-            assert!(diff <= 1,
-                "u={}: inline={}, compensated={}, diff={}", u, r, compensated, diff);
+            assert!(
+                diff <= 1,
+                "u={}: inline={}, compensated={}, diff={}",
+                u,
+                r,
+                compensated,
+                diff
+            );
         }
     }
 
@@ -1003,8 +1161,12 @@ mod tests {
         let coeffs = &LN_REMEZ_HP_COEFFS;
         for u in [0i128, SCALE_HP / 20, SCALE_HP / 9, -SCALE_HP / 9] {
             let dw = horner_compensated_hp_dw(&coeffs[..], u).unwrap();
-            assert!(dw.lo().abs() < 12 * SCALE_HP,
-                "u={}: lo={} exceeds 12*SCALE_HP", u, dw.lo());
+            assert!(
+                dw.lo().abs() < 12 * SCALE_HP,
+                "u={}: lo={} exceeds 12*SCALE_HP",
+                u,
+                dw.lo()
+            );
         }
     }
 
@@ -1016,13 +1178,22 @@ mod tests {
 
     #[test]
     fn test_fp_mul_hp_i_rejects_magnitude_above_i128_min() {
-        assert_eq!(fp_mul_hp_i(i128::MIN, SCALE_HP + 1), Err(SolMathError::Overflow));
+        assert_eq!(
+            fp_mul_hp_i(i128::MIN, SCALE_HP + 1),
+            Err(SolMathError::Overflow)
+        );
     }
 
     #[test]
     fn test_horner_hp_no_panic() {
         let coeffs = &LN_REMEZ_HP_COEFFS;
-        for u in [-SCALE_HP / 9, -SCALE_HP / 20, 0, SCALE_HP / 20, SCALE_HP / 9] {
+        for u in [
+            -SCALE_HP / 9,
+            -SCALE_HP / 20,
+            0,
+            SCALE_HP / 20,
+            SCALE_HP / 9,
+        ] {
             let _ = horner_compensated_hp(&coeffs[..], u).unwrap();
             let _ = horner_compensated_hp_dw(&coeffs[..], u).unwrap();
         }

@@ -1,150 +1,158 @@
-# SolMath — Security Properties
+# SolMath security model
 
-This document covers the safety guarantees of `solmath`: panic behaviour,
-overflow handling, domain checking, and the distinction between public API
-contracts and internal fast paths.
+SolMath is designed for deterministic, value-bearing arithmetic in constrained
+Rust runtimes. Its security model is based on explicit numeric domains, checked
+intermediates, bounded execution, typed validation at program boundaries, and
+reproducible numerical evidence.
 
----
+## Reporting
 
-## No panics in the production public API
+Report a vulnerability privately through the repository's GitHub
+**Security → Report a vulnerability** flow. The maintainer will acknowledge a
+report within five business days and coordinate disclosure. The latest
+published release and the current main branch receive fixes.
 
-All public functions are either infallible or return `Result<_, SolMathError>`.
-The four error variants and their triggers:
+## Enforced runtime properties
 
-| Variant | When it fires |
-|---------|---------------|
-| `DomainError` | Input outside the mathematical domain (ln of zero, zero barrier level, token_decimals > 38, …) |
-| `Overflow` | Intermediate or final result would exceed the representable integer range |
-| `DivisionByZero` | Divisor is zero in a divide operation |
-| `NoConvergence` | Iterative solver (implied_vol) ran out of iterations |
+| Property | Enforcement |
+|---|---|
+| Safe Rust | `#![forbid(unsafe_code)]` at the crate root |
+| Deterministic runtime | integer-only implementation; no floating point |
+| `no_std` | `#![no_std]` with zero dependencies |
+| No allocation | fixed-size values and arrays; no allocator |
+| Explicit failure | public computations are infallible or return `Result` |
+| Bounded execution | iterative methods have fixed iteration caps |
+| Overflow handling | checked primitives plus U256 widened paths |
+| Profile consistency | debug and release tests run with overflow checks both on and off |
+| Production panic gate | CI rejects `unwrap`, `expect`, `panic`, and `unreachable` in the library |
 
-The only `panic!`/`unwrap`/`expect` calls found in the crate are in tests,
-rustdoc examples, test-only helpers, and `debug_assert!` statements. The
-`debug_assert!` checks are compiled out in release builds, including Solana
-`.so` deployments.
+The public error contract has four variants:
 
----
+| Error | Meaning |
+|---|---|
+| `DomainError` | The input does not define a supported mathematical problem |
+| `Overflow` | The final value cannot be represented safely |
+| `DivisionByZero` | A required divisor is zero |
+| `NoConvergence` | An iterative/error-gated computation cannot return the requested result |
 
-## No unsafe code
+This keeps numerical outcomes in the normal control flow of a Solana
+instruction. Integrations can map each variant to their own program error and
+retry, reject, or select another quote path as appropriate.
 
-The library is entirely safe Rust. There is no `unsafe` block anywhere in
-`solmath`. This is enforced by `#![forbid(unsafe_code)]` in `lib.rs`.
+## Arithmetic and overflow
 
----
+SolMath uses three layers of arithmetic protection.
 
-## No heap allocation
+### Checked operations
 
-`solmath` is `#![no_std]` with zero dependencies. It never allocates.
-Every value lives on the stack or in a register. This is a hard requirement
-for Solana on-chain programs.
+`checked_add`, `checked_sub`, `checked_mul`, and checked conversions are the
+default throughout the implementation. A non-representable result becomes
+`SolMathError::Overflow`.
 
----
+### Widened intermediates
 
-## Overflow strategy
+Multiplication followed by division frequently has a representable result even
+when `a * b` does not fit in `u128`. `fp_mul`, `fp_div`, and the
+`checked_mul_div_*` / `mul_div_*_u128` families use software U256 arithmetic for
+that case. The widened path preserves the exact quotient/remainder relationship
+before the requested rounding rule is applied.
 
-The library has three layers of overflow defence:
+### Entry-domain validation
 
-### 1. Checked primitive arithmetic
+Pricing and DeFi functions validate their numeric and relational domains before
+entering sensitive kernels. The `checked` module turns those constraints into
+types such as `EuropeanInputs`, `ImpliedVolInputs`, `BarrierInputs`,
+`TwapInputs`, and `PoolSwapInputs`. Programs can validate raw instruction data
+once and carry a valid domain through the rest of the calculation.
 
-Throughout the codebase, `checked_mul`, `checked_add`, `checked_sub` etc. are
-the default. Any failure propagates as `Err(SolMathError::Overflow)`.
+## Internal optimized kernels
 
-```rust
-// Example from fp_mul:
-match a.checked_mul(b) {
-    Some(p) => Ok(p / SCALE),
-    None => checked_mul_div_u(a, b, SCALE).ok_or(SolMathError::Overflow),
-}
-```
+A small number of `pub(crate)` multiply helpers omit repeated checks inside
+already reduced polynomial domains. They are not callable by downstream code.
+Their callers establish bounds before entry:
 
-### 2. U256 fallback for wide multiplications
+| Internal path | Established bound |
+|---|---|
+| Trig polynomial multiplication | angle has been reduced to the certified core interval |
+| HP log/exp multiplication | operands are bounded by the range-reduction contract |
+| IV rational initializer | price-like inputs and normalized variables are capped before evaluation |
 
-When a `u128 × u128` product exceeds `u128::MAX`, the library falls through to
-a software U256 path rather than returning an error immediately. This means
-functions like `fp_mul`, `fp_mul_i`, and the `checked_mul_div_*` family succeed
-for all inputs whose *final* result fits in u128/i128, even if the intermediate
-product doesn't.
+Changing one of these domains requires the associated invariant, accuracy, and
+overflow tests to change with it.
 
-The U256 implementation (`overflow.rs`) uses 128-bit limbs and a long-division
-fallback verified by `debug_assert` against the long-division reference.
+## Model contracts
 
-### 3. Explicit bounds guards at function entry
+Each higher-level model exposes the domain it actually implements. A contract
+boundary is returned as an error rather than extended by silent extrapolation.
 
-High-level functions add domain-specific guards before entering arithmetic. For
-example, `heston_price` rejects any parameter that exceeds `i128::MAX` or the
-i64-scale limit used by the characteristic function:
+| Model | Runtime contract |
+|---|---|
+| Black–Scholes | Positive price, strike, volatility, and time within the public numeric bounds |
+| Implied volatility | Bounded solver with `NoConvergence` for prices without a resolvable volatility at `SCALE` |
+| American KBI | `0–12%` rates/yields, `10–120%` volatility, `30/365–2` years, and `abs(ln(S/K)) <= 0.75` |
+| Exponential NIG | Published alpha/beta, elapsed-scale, rate, time, and moneyness domain plus caller-selected error allowance |
+| Arithmetic-Asian/TWAP | Coherent fixed average/weight and averaging times; fixing state supplied by the integration |
+| Barrier options | State-aware API accepts the persisted historical breach flag |
+| Deterministic Heston | Exact `xi = 0` integrated-variance reduction; other positive-expiry `xi` values return `NoConvergence` |
+| SABR | Individual analytics plus an atomic whole-grid certificate for parity, bounds, verticals, butterflies, and calendars |
+| Bivariate normal | Analytic endpoint handling and guarded quadrature; unresolved near-singular boundary cases return `NoConvergence` |
+| Fixed-correlation Phi2 | Raw analytics lookup or certificate-ID/error-budget-bound evaluation |
 
-```rust
-if s > i128::MAX as u128 || k > i128::MAX as u128 || … {
-    return Err(SolMathError::Overflow);
-}
-```
+The detailed KBI, NIG, and TWAP contracts are in
+[`docs/AMERICAN_KBI.md`](docs/AMERICAN_KBI.md),
+[`docs/NIG.md`](docs/NIG.md), and
+[`docs/ASIAN_TWAP.md`](docs/ASIAN_TWAP.md).
 
----
+## Rounding and settlement
 
-## Internal fast paths
+The crate exposes truncating, nearest, floor, and ceiling variants rather than
+hiding an economic rounding choice. `fp_to_token_floor` and
+`fp_to_token_ceil` make payout and collection policy explicit at the conversion
+boundary. Weighted-pool execution rounds output down and the fee up.
 
-Two internal functions perform unchecked multiplication:
+For barriers and in-progress averages, mathematical parameters are only part of
+the contract state. Integrations should derive breach/fixing state from their
+persisted accounts or oracle observations before calling the model.
 
-| Function | Where used | Why it is safe |
-|----------|-----------|----------------|
-| `fp_mul_i_fast(a, b)` | Trig polynomial cores (`sin_core`, `cos_core`), Heston CF | Inputs are reduction-bounded; comments prove `\|a*b\| < i128::MAX` at every call site |
-| `fp_mul_hp_fast(a, b)` | HP ln/exp polynomial evaluation | Callers guarantee `\|a\|, \|b\| <= ~40*SCALE_HP`; product <= 1.6e33, fits i128 (max ~1.7e38) |
-| `mul_fast(a, b)` in `iv.rs` | Li rational-guess polynomial | IV solver validates inputs; comments bound each product to ~24 decimal digits < i128::MAX |
+## Verification
 
-These are `pub(crate)` and cannot be called from external code. Every call site
-carries a comment explaining why no overflow can occur.
+The release workflow exercises several independent layers:
 
----
+- no-default, default, all-feature, MSRV, and embedded `no_std` builds;
+- debug and release tests with overflow checks forced both on and off;
+- deterministic five-million-iteration checked-input and financial-invariant
+  sweeps;
+- strict production Clippy gates for panic-like constructs;
+- thirteen Kani harnesses covering 545 bit-precise checks, including full-width
+  U256 carry/division bounds, exact square-root Newton/bisection transitions, truncation,
+  nearest-rounding, overflow, and double-word ULP invariants;
+- source-digest-gated Arb/exact-integer certificates for `ln`, `exp`, and the
+  standard normal CDF;
+- high-precision and QuantLib comparison corpora for pricing models;
+- deployed-SBF footprint and compute campaigns;
+- dependency, package-surface, and secret/history checks.
 
-## Angle reduction safety
+The standard `ln` certificate establishes at most 3 ULP over its valid `u128`
+domain. The normal-CDF certificate establishes at most 2 ULP, exact symmetry,
+and monotonicity for every `i128`. Model-specific empirical and analytical
+results are indexed in [VALIDATION.md](VALIDATION.md) and
+[PROOFS.md](https://github.com/DJBarker87/solmath/blob/v0.2.0/PROOFS.md).
 
-`sin_fixed` and `cos_fixed` reduce arbitrary angles via `rem_euclid`, which
-handles `i128::MIN` correctly (unlike the raw `%` operator, which has
-implementation-defined sign for negative dividends in many languages). The
-reduced value is always in `(-π, π]` before polynomial evaluation.
+## Integration boundary
 
----
+SolMath supplies numerical functions; a consuming program supplies the
+surrounding protocol controls. Account ownership, signer/PDA authorization,
+oracle provenance and freshness, volatility calibration, slippage, transaction
+composition, and upgrade policy remain part of that program.
 
-## Division-by-zero handling
+Measure the exact linked program before choosing compute limits. The repository
+figures isolate SolMath calls and benchmark instructions; account
+serialization, logs, oracle reads, and CPIs add to the final transaction.
 
-- `fp_div`, `fp_div_i`, `fp_div_floor`, `fp_div_ceil`, `fp_div_round` — return
-  `Err(DivisionByZero)` when the divisor is zero.
-- `fp_div_hp_safe` — same.
-- `weighted_pool_swap` — returns `Err(DivisionByZero)` when `weight_out == 0`.
-- All `checked_mul_div_*` variants — check `c == 0` and return `None`/`Err`.
+## Assurance record
 
----
-
-## Convergence and iteration bounds
-
-`implied_vol` uses three successive methods (Li rational initial guess → Halley
-→ Jaeckel rational). Each iteration loop has an explicit `max_iter` cap. If the
-solver does not converge inside the cap it returns `Err(NoConvergence)` rather
-than looping forever.
-
----
-
-## What is not guaranteed
-
-- **Accuracy after extreme inputs.** The library is designed for financially
-  realistic inputs (spot/strike in reasonable ranges, σ ∈ (0, 5), T ∈ (0, 10)).
-  Functions will *not panic* outside these ranges and will *attempt* to return a
-  result, but accuracy is not validated beyond the tested parameter space.
-  See `PROOFS.md` and the benchmark validation reports for tested ranges.
-
-- **Cryptographic security.** SolMath is financial math, not a cryptographic
-  library. No timing-side-channel guarantees are made.
-
-- **Formal verification.** Error bounds in `PROOFS.md` are analytically derived
-  with AI assistance but have not been independently machine-checked.
-
----
-
-## Audit history
-
-No independent third-party audit is claimed for the published crate. The
-current public validation consists of reproducible reference vectors,
-deterministic property-style tests, and internal review documented in
-`PROOFS.md` and the generated test data. Treat financial-model use as unaudited
-until your integration has its own review.
+Release evidence is retained as generated corpora, machine-readable reports,
+source-bound certificates, deterministic tests, and SBF artifacts. That
+reproducible record defines the assurance scope of `0.2.0`; downstream reviews
+can extend it to the exact accounts, oracles, and economic rules of an
+integrating program.
