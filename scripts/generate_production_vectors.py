@@ -79,18 +79,29 @@ def stratified_2d(buckets_x, buckets_y, n_per_cell):
 def crosscheck(vectors, scipy_fn, key_in, key_expected, tol, label):
     """Cross-check 1000 random samples against a scipy reference."""
     samples = random.sample(vectors, min(1000, len(vectors)))
-    errors = 0
+    mismatches = 0
+    exceptions = 0
+    first_exception = None
     for v in samples:
         try:
             scipy_ref = scipy_fn(v)
             mpmath_ref = int(v[key_expected])
             if abs(scipy_ref - mpmath_ref) > tol:
-                errors += 1
-        except:
-            pass
-    status = "OK" if errors == 0 else f"WARNING: {errors} mismatches"
+                mismatches += 1
+        except Exception as exc:
+            exceptions += 1
+            if first_exception is None:
+                first_exception = repr(exc)
+    if not samples:
+        raise RuntimeError(f"{label} cross-check selected zero samples")
+    status = "OK" if mismatches == 0 and exceptions == 0 else (
+        f"FAILED: {mismatches} mismatches, {exceptions} reference errors"
+    )
     print(f"    Cross-check vs {label}: {len(samples)} samples, {status}")
-    return errors
+    if mismatches or exceptions:
+        detail = f"; first error: {first_exception}" if first_exception else ""
+        raise RuntimeError(f"{label} cross-check failed{detail}")
+    return 0
 
 
 # ════════════════════════════════════════════════════════════
@@ -158,6 +169,7 @@ def _bs_greeks_ref(S_fp, K_fp, r_fp, sigma_fp, T_fp):
 
 def gen_prod_ln():
     print("  ln_fixed_i ...")
+    rng = random.Random(0x1A2026)
     buckets = [
         (0.001, 0.01),
         (0.01, 0.1),
@@ -171,21 +183,22 @@ def gen_prod_ln():
     n_per = N // len(buckets)
 
     vectors = []
-    for lo, hi in buckets:
+    for bucket_index, (lo, hi) in enumerate(buckets):
         for _ in range(n_per):
             if lo < 1 and hi > 1:
-                x_real = random.uniform(lo, hi)
+                x_real = rng.uniform(lo, hi)
             else:
                 log_lo = math.log10(lo)
                 log_hi = math.log10(hi)
-                x_real = 10 ** random.uniform(log_lo, log_hi)
+                x_real = 10 ** rng.uniform(log_lo, log_hi)
             x = int(x_real * SCALE)
             if x <= 0:
                 continue
             ref = _nint(mpmath.log(mpmath.mpf(x) / SCALE) * SCALE)
             if ref > I128_MAX or ref < I128_MIN:
                 continue
-            vectors.append({"x": _to_str(x), "expected": _to_str(ref)})
+            vectors.append({"x": _to_str(x), "expected": _to_str(ref),
+                            "category": f"bucket_{bucket_index}_{lo}_{hi}"})
 
     crosscheck(vectors,
         lambda v: int(round(float(np.log(float(int(v['x'])) / SCALE)) * SCALE)),
@@ -194,6 +207,100 @@ def gen_prod_ln():
     save_vectors("prod_ln_vectors.json", vectors,
                  {"suite": "production", "function": "ln_fixed_i",
                   "domain": "log-uniform [0.001, 1e15], 8 stratified decades",
+                  "n": len(vectors)})
+
+
+def gen_prod_ln_1p():
+    print("  ln_1p_fixed ...")
+    vectors = []
+
+    def add(x, category):
+        if x <= -SCALE or x > I128_MAX:
+            return
+        ref = _nint(mpmath.log1p(mpmath.mpf(x) / SCALE) * SCALE)
+        if I128_MIN <= ref <= I128_MAX:
+            vectors.append({"x": _to_str(x), "expected": _to_str(ref),
+                            "category": category})
+
+    # Ten equally weighted regimes cover the domain edge, ordinary rates,
+    # the sub-ULP cancellation region, and large positive values.
+    for _ in range(N // 10):
+        one_plus_x_raw = int(10 ** random.uniform(0, 10))
+        add(-SCALE + max(1, one_plus_x_raw), "near_domain_edge")
+    for _ in range(N // 10):
+        add(random.randint(-990_000_000_000, -500_000_000_000), "negative_large")
+    for _ in range(N // 10):
+        add(random.randint(-500_000_000_000, -10_000_000_000), "negative_mid")
+    for _ in range(N // 10):
+        add(random.randint(-10_000_000_000, -1_000_000), "negative_small")
+    for _ in range(N // 10):
+        add(random.randint(-999_999, -1), "near_zero_negative")
+    for _ in range(N // 10):
+        add(random.randint(0, 999_999), "near_zero_nonnegative")
+    for _ in range(N // 10):
+        add(random.randint(1_000_000, 10_000_000_000), "positive_small")
+    for _ in range(N // 10):
+        add(random.randint(10_000_000_000, SCALE), "positive_mid")
+    for _ in range(N // 10):
+        real = 10 ** random.uniform(0, 6)
+        add(int(real * SCALE), "positive_large")
+    for _ in range(N // 10):
+        real = 10 ** random.uniform(6, 15)
+        add(int(real * SCALE), "positive_huge")
+
+    # IEEE f64 cannot preserve raw-unit inputs immediately above x=-1 or at
+    # very large magnitudes, so use the ordinary-rate subset for the secondary
+    # NumPy cross-check. mpmath remains the primary reference for every row.
+    numpy_safe = [v for v in vectors
+                  if v["category"] not in ("near_domain_edge", "positive_huge")]
+    crosscheck(
+        numpy_safe,
+        lambda v: int(round(float(np.log1p(float(int(v['x'])) / SCALE)) * SCALE)),
+        'x', 'expected', 100, 'numpy.log1p')
+
+    save_vectors("prod_ln_1p_vectors.json", vectors,
+                 {"suite": "production", "function": "ln_1p_fixed",
+                  "domain": "10 equal regimes over (-1, 1e15], including raw-unit near-zero inputs",
+                  "reference": "mpmath.log1p at 50 decimal digits; 1,000-sample numpy.log1p cross-check",
+                  "n": len(vectors)})
+
+
+def gen_prod_expm1():
+    print("  expm1_fixed ...")
+    vectors = []
+
+    def add(x, category):
+        ref = _nint(mpmath.expm1(mpmath.mpf(x) / SCALE) * SCALE)
+        if I128_MIN <= ref <= I128_MAX:
+            vectors.append({"x": _to_str(x), "expected": _to_str(ref),
+                            "category": category})
+
+    regimes = (
+        (-40 * SCALE, -20 * SCALE, "negative_saturation"),
+        (-20 * SCALE, -2 * SCALE, "negative_large"),
+        (-2 * SCALE, -SCALE // 2, "negative_mid"),
+        (-SCALE // 2, -1_000_000, "negative_small"),
+        (-999_999, -1, "near_zero_negative"),
+        (0, 999_999, "near_zero_nonnegative"),
+        (1_000_000, SCALE // 2, "positive_small"),
+        (SCALE // 2, 2 * SCALE, "positive_mid"),
+        (2 * SCALE, 20 * SCALE, "positive_large"),
+        (20 * SCALE, 40 * SCALE - 1, "near_overflow"),
+    )
+    for lo, hi, category in regimes:
+        for _ in range(N // len(regimes)):
+            add(random.randint(lo, hi), category)
+
+    numpy_safe = [v for v in vectors if abs(int(v["x"])) <= 2 * SCALE]
+    crosscheck(
+        numpy_safe,
+        lambda v: int(round(float(np.expm1(float(int(v['x'])) / SCALE)) * SCALE)),
+        'x', 'expected', 2, 'numpy.expm1')
+
+    save_vectors("prod_expm1_vectors.json", vectors,
+                 {"suite": "production", "function": "expm1_fixed",
+                  "domain": "10 equal regimes over [-40,40), including raw near-zero inputs",
+                  "reference": "mpmath.expm1 at 50 decimal digits; 1,000-sample numpy.expm1 cross-check",
                   "n": len(vectors)})
 
 
@@ -242,25 +349,35 @@ def gen_prod_exp():
         (3, 10),
         (10, 20),
     ]
-    n_per = N // len(buckets)
-
     vectors = []
-    for lo, hi in buckets:
-        for _ in range(n_per):
+    quotient, remainder = divmod(N, len(buckets))
+    for bucket_index, (lo, hi) in enumerate(buckets):
+        # Distribute the remainder instead of silently emitting 99,999 rows
+        # when N is not divisible by the nine production regimes.
+        count = quotient + (1 if bucket_index < remainder else 0)
+        for _ in range(count):
             x_real = random.uniform(lo, hi)
             x = int(x_real * SCALE)
             ref = _nint(mpmath.exp(mpmath.mpf(x) / SCALE) * SCALE)
             if ref > I128_MAX or ref <= 0:
                 continue
-            vectors.append({"x": _to_str(x), "expected": _to_str(ref)})
+            vectors.append({"x": _to_str(x), "expected": _to_str(ref),
+                            "category": f"bucket_{bucket_index}_{lo}_{hi}"})
 
-    crosscheck(vectors,
+    # At large positive x, converting the scaled result to binary64 loses far
+    # more than 1,000 raw decimal units even when both references agree. Keep
+    # the independent NumPy check in the ordinary |x| <= 3 domain where its
+    # integer conversion has adequate resolution; mpmath is authoritative for
+    # all 100,000 rows.
+    numpy_safe = [v for v in vectors if abs(int(v["x"])) <= 3 * SCALE]
+    crosscheck(numpy_safe,
         lambda v: int(round(float(np.exp(float(int(v['x'])) / SCALE)) * SCALE)),
         'x', 'expected', 1000, 'numpy')
 
     save_vectors("prod_exp_vectors.json", vectors,
                  {"suite": "production", "function": "exp_fixed_i",
                   "domain": "[-20, 20] stratified 9 buckets, oversampled near 0",
+                  "reference": "mpmath.exp at 50 decimal digits; 1,000-sample NumPy cross-check over |x| <= 3",
                   "n": len(vectors)})
 
 
@@ -378,6 +495,7 @@ def gen_prod_cos():
 
 def gen_prod_norm_cdf():
     print("  norm_cdf_poly ...")
+    rng = random.Random(0xCDF2026)
     buckets = [
         (-6, -3),
         (-3, -2),
@@ -391,12 +509,13 @@ def gen_prod_norm_cdf():
     n_per = N // len(buckets)
 
     vectors = []
-    for lo, hi in buckets:
+    for bucket_index, (lo, hi) in enumerate(buckets):
         for _ in range(n_per):
-            x_real = random.uniform(lo, hi)
+            x_real = rng.uniform(lo, hi)
             x = int(x_real * SCALE)
             ref = _nint(mpmath.ncdf(mpmath.mpf(x) / SCALE) * SCALE)
-            vectors.append({"x": _to_str(x), "expected": _to_str(ref)})
+            vectors.append({"x": _to_str(x), "expected": _to_str(ref),
+                            "category": f"bucket_{bucket_index}_{lo}_{hi}"})
 
     crosscheck(vectors,
         lambda v: int(round(float(scipy.stats.norm.cdf(float(int(v['x'])) / SCALE)) * SCALE)),
@@ -979,6 +1098,22 @@ if __name__ == '__main__':
     print("SolMath Production Validation Vector Generator")
     print(f"N = {N} vectors per function, stratified domains\n")
 
+    if "--ln-1p-only" in sys.argv:
+        gen_prod_ln_1p()
+        sys.exit(0)
+    if "--expm1-only" in sys.argv:
+        gen_prod_expm1()
+        sys.exit(0)
+    if "--exp-only" in sys.argv:
+        gen_prod_exp()
+        sys.exit(0)
+    if "--ln-only" in sys.argv:
+        gen_prod_ln()
+        sys.exit(0)
+    if "--norm-cdf-only" in sys.argv:
+        gen_prod_norm_cdf()
+        sys.exit(0)
+
     # Arithmetic
     gen_prod_fp_mul()
     gen_prod_fp_mul_i()
@@ -988,6 +1123,8 @@ if __name__ == '__main__':
 
     # Transcendentals
     gen_prod_ln()
+    gen_prod_ln_1p()
+    gen_prod_expm1()
     gen_prod_ln_hp()
     gen_prod_exp()
     gen_prod_exp_hp()

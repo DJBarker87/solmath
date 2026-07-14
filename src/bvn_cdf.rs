@@ -1,4 +1,4 @@
-use crate::arithmetic::{fp_div_i, fp_mul_i};
+use crate::arithmetic::{fp_div_i, fp_mul_i, fp_sqrt};
 use crate::constants::PI_OVER_2_SCALE;
 use crate::error::SolMathError;
 use crate::normal::norm_cdf_poly;
@@ -72,15 +72,13 @@ const GL20_WEIGHTS: [i128; 20] = [
 ];
 
 const INV_TWO_PI: i128 = 159_154_943_092;
-const RHO_NEAR_ONE: i128 = SCALE_I - 1_000_000; // 1 - 1e-6
-
 #[inline]
 fn clamp_prob(value: i128) -> i128 {
     value.clamp(0, SCALE_I)
 }
 
 fn asin_fixed(x: i128) -> Result<i128, SolMathError> {
-    if x.abs() > SCALE_I {
+    if x < -SCALE_I || x > SCALE_I {
         return Err(SolMathError::DomainError);
     }
     if x == SCALE_I {
@@ -88,6 +86,15 @@ fn asin_fixed(x: i128) -> Result<i128, SolMathError> {
     }
     if x == -SCALE_I {
         return Ok(-PI_OVER_2_SCALE);
+    }
+
+    // Newton loses leverage as cos(theta) approaches zero. Reflect endpoint
+    // arguments into a well-conditioned small-angle problem.
+    if x.unsigned_abs() > 990_000_000_000 {
+        let one_minus_x2 = (SCALE_I - fp_mul_i(x, x)?).max(0);
+        let small = fp_sqrt(one_minus_x2 as u128)? as i128;
+        let theta = PI_OVER_2_SCALE - asin_fixed(small)?;
+        return Ok(if x < 0 { -theta } else { theta });
     }
 
     let x2 = fp_mul_i(x, x)?;
@@ -187,19 +194,50 @@ fn bvn_cdf_with_gl(
     nodes: &[i128],
     weights: &[i128],
 ) -> Result<i128, SolMathError> {
-    if rho.abs() > SCALE_I {
+    if rho < -SCALE_I || rho > SCALE_I {
         return Err(SolMathError::DomainError);
     }
-    if rho >= RHO_NEAR_ONE {
+    if rho == SCALE_I {
         return norm_cdf_poly(x.min(y));
     }
-    if rho <= -RHO_NEAR_ONE {
+    if rho == -SCALE_I {
         let value = norm_cdf_poly(x)?
             .checked_add(norm_cdf_poly(y)?)
             .ok_or(SolMathError::Overflow)?
             .checked_sub(SCALE_I)
             .ok_or(SolMathError::Overflow)?;
         return Ok(clamp_prob(value));
+    }
+
+    // Near a singular correlation, direct angular GL quadrature develops a
+    // narrow boundary layer. If the thresholds are separated by more than
+    // eight conditional standard deviations, the corresponding analytic
+    // ±1 limit is accurate beyond fixed-point resolution and preserves
+    // monotonicity at the endpoint. Equal/near-equal thresholds stay on GL.
+    let rho_sq = fp_mul_i(rho, rho)?;
+    let conditional_std = fp_sqrt((SCALE_I - rho_sq).max(0) as u128)?;
+    let separation = if rho >= 0 {
+        x.abs_diff(y)
+    } else {
+        x.checked_add(y).map_or(u128::MAX, i128::unsigned_abs)
+    };
+    if separation > conditional_std.saturating_mul(8) {
+        if rho >= 0 {
+            return norm_cdf_poly(x.min(y));
+        }
+        let value = norm_cdf_poly(x)?
+            .checked_add(norm_cdf_poly(y)?)
+            .ok_or(SolMathError::Overflow)?
+            .checked_sub(SCALE_I)
+            .ok_or(SolMathError::Overflow)?;
+        return Ok(clamp_prob(value));
+    }
+    // The angular quadrature develops an unresolved boundary layer for
+    // near-singular, near-equal thresholds. The validated numerical domain
+    // ends at |rho| = 0.99; exact endpoints and the analytically safe
+    // separated-threshold limit above are handled explicitly.
+    if rho.unsigned_abs() > 990_000_000_000 {
+        return Err(SolMathError::NoConvergence);
     }
 
     if x > 0 && y > 0 {
@@ -237,7 +275,8 @@ fn bvn_cdf_with_gl(
 // Public API
 // ═══════════════════════════════════════════════════════════════
 
-/// General bivariate normal CDF. Any `ρ`. ~129K CU median, 153K max.
+/// General bivariate normal CDF with guarded near-singular correlation.
+/// Final SBF audit: 72,018 CU average, 16,922 median, 208,693 max.
 ///
 /// Computes `P(X ≤ a, Y ≤ b)` where `(X, Y) ~ N(0, 0, 1, 1, ρ)`.
 ///
@@ -251,19 +290,25 @@ fn bvn_cdf_with_gl(
 /// - `|ρ| ≤ 0.95`: max error < 5×10⁻⁶
 /// - `|ρ| ≤ 0.99`: max error < 10⁻⁴
 ///
-/// Near `ρ = ±1` the routine switches to the analytic limit.
+/// Exact `ρ = ±1` uses the analytic limit. For `0.99 < |ρ| < 1`, unequal
+/// thresholds use that limit only when their separation makes its omitted
+/// conditional tail smaller than one fixed-point unit; the unresolved
+/// near-equal boundary layer returns `NoConvergence`.
 ///
 /// # Errors
 ///
 /// - `DomainError` if `|rho| > SCALE`.
 /// - `Overflow` from internal fixed-point operations (extreme inputs).
+/// - `NoConvergence` in the unresolved near-singular boundary layer.
 pub fn bvn_cdf(a: i128, b: i128, rho: i128) -> Result<i128, SolMathError> {
     bvn_cdf_with_gl(a, b, rho, &GL6_NODES, &GL6_WEIGHTS)
 }
 
-/// High-precision bivariate normal CDF. Any `ρ`. ~331K CU. Accuracy < 10⁻⁶.
+/// High-precision bivariate normal CDF with guarded near-singular correlation.
+/// Final SBF audit: 163,498 CU average, 16,922 median, 468,417 max.
 ///
-/// 20-point Gauss-Legendre. Use offline for table generation and validation.
+/// 20-point Gauss-Legendre. Within `|rho| <= .99`, the fresh reference corpus
+/// observed max 123 raw probability units. Use offline for table generation and validation.
 /// Not recommended on-chain — use [`bvn_cdf`] (GL6) instead.
 ///
 /// All inputs/outputs are signed fixed-point `i128` at `SCALE` (1e12).
@@ -272,7 +317,39 @@ pub fn bvn_cdf(a: i128, b: i128, rho: i128) -> Result<i128, SolMathError> {
 ///
 /// - `DomainError` if `|rho| > SCALE`.
 /// - `Overflow` from internal fixed-point operations (extreme inputs).
+/// - `NoConvergence` in the unresolved near-singular boundary layer.
 pub fn bvn_cdf_hp(a: i128, b: i128, rho: i128) -> Result<i128, SolMathError> {
     bvn_cdf_with_gl(a, b, rho, &GL20_NODES, &GL20_WEIGHTS)
 }
 
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    #[test]
+    fn minimum_correlation_is_a_domain_error_not_a_panic() {
+        assert_eq!(bvn_cdf(0, 0, i128::MIN), Err(SolMathError::DomainError));
+        assert_eq!(bvn_cdf_hp(0, 0, i128::MIN), Err(SolMathError::DomainError));
+    }
+
+    #[test]
+    fn unresolved_near_perfect_equal_thresholds_fail_closed() {
+        assert_eq!(
+            bvn_cdf_hp(0, 0, 999_998_999_999),
+            Err(SolMathError::NoConvergence)
+        );
+        assert_eq!(
+            bvn_cdf_hp(0, 0, -999_998_999_999),
+            Err(SolMathError::NoConvergence)
+        );
+    }
+
+    #[test]
+    fn near_perfect_correlation_uses_stable_unequal_threshold_limit() {
+        let expected = norm_cdf_poly(-SCALE_I / 4).unwrap();
+        let near = bvn_cdf_hp(-SCALE_I / 4, 0, 999_999_999_999).unwrap();
+        let endpoint = bvn_cdf_hp(-SCALE_I / 4, 0, SCALE_I).unwrap();
+        assert_eq!(near, expected);
+        assert_eq!(endpoint, expected);
+    }
+}

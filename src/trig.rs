@@ -1,6 +1,19 @@
-use crate::constants::*;
 use crate::arithmetic::fp_mul_i_fast;
+use crate::constants::*;
 use crate::error::SolMathError;
+
+/// Largest angle covered by the two-word period reduction error bound:
+/// 1e25 raw = 1e13 radians at SCALE.
+const MAX_TRIG_ANGLE: i128 = 10_000_000_000_000_000_000_000_000;
+
+#[inline]
+fn validate_angle(x: i128) -> Result<(), SolMathError> {
+    if x.unsigned_abs() > MAX_TRIG_ANGLE as u128 {
+        Err(SolMathError::DomainError)
+    } else {
+        Ok(())
+    }
+}
 
 /// Core sin on [−π/4, π/4]: sin(x) = x × P(x²). Internal — called by sin_fixed.
 pub(crate) fn sin_core(x: i128) -> Result<i128, SolMathError> {
@@ -30,9 +43,30 @@ pub(crate) fn cos_core(x: i128) -> Result<i128, SolMathError> {
 
 /// Reduce angle to (−π, π] with Cody-Waite compensation. Internal.
 pub(crate) fn reduce_mod_2pi(x: i128) -> i128 {
-    // Use Euclidean reduction against the full fixed-point period so every i128 input,
-    // including i128::MIN, lands in a small bounded range before polynomial evaluation.
+    // Two-stage reduction: Euclidean reduction against the rounded period
+    // (handles every i128 input, including i128::MIN), then fold back q times
+    // the sub-ULP residual — TWO_PI_SCALE overshoots 2π by ~0.41 ULP, so the
+    // plain remainder drifts ~0.41 ULP per elapsed period (61K ULP of phase
+    // error at |x| ≈ 1e6 rad without this). Each pass shrinks |q| by ~13
+    // orders of magnitude, so at most 3 passes run even from i128::MAX.
     let mut r = x.rem_euclid(TWO_PI_SCALE);
+    let mut q = x.div_euclid(TWO_PI_SCALE);
+    while q != 0 {
+        // |q| ≤ i128::MAX/TWO_PI_SCALE ≈ 2.7e25; |q·TWO_PI_LO| ≤ 1.2e37 ≪ i128::MAX.
+        let corr = q * (-TWO_PI_LO); // sub-ULP units
+        let corr_ulp = if corr >= 0 {
+            (corr + SCALE_I / 2) / SCALE_I
+        } else {
+            (corr - SCALE_I / 2) / SCALE_I
+        };
+        if corr_ulp == 0 {
+            break;
+        }
+        // r < TWO_PI_SCALE ≈ 6.3e12, |corr_ulp| ≤ 1.2e25: sum fits i128.
+        let t = r + corr_ulp;
+        r = t.rem_euclid(TWO_PI_SCALE);
+        q = t.div_euclid(TWO_PI_SCALE);
+    }
     if r > PI_SCALE {
         r -= TWO_PI_SCALE;
     }
@@ -41,9 +75,10 @@ pub(crate) fn reduce_mod_2pi(x: i128) -> i128 {
 
 /// Sine of angle x in radians at SCALE.
 ///
-/// - **x**: signed fixed-point radians at `SCALE` (1e12). Any value accepted.
+/// - **x**: signed fixed-point radians at `SCALE` (1e12), with
+///   `|x| <= 1e25` raw (1e13 radians).
 /// - **Returns**: `Result<i128, SolMathError>` — value at `SCALE`, in [-SCALE, SCALE].
-/// - **Accuracy**: max 2 ULP, ~47% exact.
+/// - **Accuracy**: max ~3 ULP over the supported range.
 ///
 /// # Example
 /// ```
@@ -54,6 +89,7 @@ pub(crate) fn reduce_mod_2pi(x: i128) -> i128 {
 /// assert!((result - SCALE_I).abs() <= 2);
 /// ```
 pub fn sin_fixed(x: i128) -> Result<i128, SolMathError> {
+    validate_angle(x)?;
     let mut xx = reduce_mod_2pi(x);
     let sign = if xx < 0 {
         xx = -xx;
@@ -77,10 +113,12 @@ pub fn sin_fixed(x: i128) -> Result<i128, SolMathError> {
 
 /// Cosine of angle x in radians at SCALE.
 ///
-/// - **x**: signed fixed-point radians at `SCALE` (1e12). Any value accepted.
+/// - **x**: signed fixed-point radians at `SCALE` (1e12), with
+///   `|x| <= 1e25` raw (1e13 radians).
 /// - **Returns**: `Result<i128, SolMathError>` — value at `SCALE`, in [-SCALE, SCALE].
-/// - **Accuracy**: max 2 ULP, ~47% exact.
+/// - **Accuracy**: max ~3 ULP over the supported range.
 pub fn cos_fixed(x: i128) -> Result<i128, SolMathError> {
+    validate_angle(x)?;
     let mut xx = reduce_mod_2pi(x);
     xx = if xx < 0 { -xx } else { xx };
     let cos_sign = if xx > PI_OVER_2_SCALE {
@@ -102,10 +140,12 @@ pub fn cos_fixed(x: i128) -> Result<i128, SolMathError> {
 
 /// Fused sine and cosine: returns `(sin(x), cos(x))` sharing one angle reduction.
 ///
-/// - **x**: signed fixed-point radians at `SCALE` (1e12). Any value accepted.
+/// - **x**: signed fixed-point radians at `SCALE` (1e12), with
+///   `|x| <= 1e25` raw (1e13 radians).
 /// - **Returns**: `Result<(i128, i128), SolMathError>` — `(sin, cos)` each at `SCALE`.
-/// - **Accuracy**: max 2 ULP each, ~47% exact.
+/// - **Accuracy**: max ~3 ULP each over the supported range.
 pub fn sincos_fixed(x: i128) -> Result<(i128, i128), SolMathError> {
+    validate_angle(x)?;
     let mut xx = reduce_mod_2pi(x);
     let sin_sign = if xx < 0 {
         xx = -xx;

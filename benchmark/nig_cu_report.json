@@ -1,0 +1,35 @@
+{
+  "run_date": "2026-07-14T16:39:29.991Z",
+  "target": "Agave local validator at http://127.0.0.1:8899",
+  "measurement": "unsigned simulateTransaction; math CU is the difference between sol_log_compute_units markers and full CU is unitsConsumed",
+  "program_id": "BdR4cSgZGQgXNo33SZSYQXy7XgEK61sHT4NQaAkc3PBm",
+  "artifact": "benchmark/sbf-composite/target/deploy/solmath_sbf_composite.so",
+  "artifact_sha256": "685d49886179ca0bec80e31d9e9b878f3d044a47869cfd2f70cc2cf194c05161",
+  "artifact_bytes": 1083408,
+  "limit_per_suite": 2000,
+  "concurrency": 32,
+  "results": [
+    {
+      "name": "nig_price_certified",
+      "total": 2000,
+      "measured": 2000,
+      "accepted": 1787,
+      "rejected": 213,
+      "errors": 0,
+      "min": 23692,
+      "average": 129872,
+      "median": 28261,
+      "p95": 347885,
+      "p99": 367321,
+      "max": 381385,
+      "accepted_average": 110009,
+      "accepted_median": 28035,
+      "accepted_p95": 350643,
+      "accepted_p99": 367931,
+      "accepted_max": 381385,
+      "transaction_average": 130929,
+      "transaction_p99": 368377,
+      "transaction_max": 382441
+    }
+  ]
+}

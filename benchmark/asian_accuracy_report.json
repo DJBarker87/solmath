@@ -1,0 +1,326 @@
+{
+  "binary": "target/release/examples/asian_batch",
+  "corpora": [
+    {
+      "accepted": 100000,
+      "category_max_raw": {
+        "fully_fixed": {
+          "expected_call": 1,
+          "expected_log_variance": 0,
+          "expected_mean": 0,
+          "expected_put": 2
+        },
+        "partial_high": {
+          "expected_call": 22580,
+          "expected_log_variance": 11,
+          "expected_mean": 24,
+          "expected_put": 22580
+        },
+        "partial_low": {
+          "expected_call": 12110,
+          "expected_log_variance": 38,
+          "expected_mean": 41,
+          "expected_put": 12109
+        },
+        "unseasoned": {
+          "expected_call": 10324,
+          "expected_log_variance": 25,
+          "expected_mean": 55,
+          "expected_put": 10324
+        }
+      },
+      "error_count": 0,
+      "errors": [],
+      "file": "benchmark/prod_asian_vectors.json",
+      "max_cases": {
+        "expected_call": {
+          "actual_raw": 1292516855198,
+          "category": "partial_high",
+          "difference_raw": 22580,
+          "expected_raw": 1292516832618,
+          "index": 73998,
+          "inputs": {
+            "averaging_time": "27155779124",
+            "fixed_average": "490348271125054",
+            "fixed_weight": "783463001134",
+            "k": "491004255994972",
+            "q": "41549074800",
+            "r": "19922217555",
+            "s": "498985480275581",
+            "sigma": "95483712338",
+            "t": "33551608118"
+          }
+        },
+        "expected_log_variance": {
+          "actual_raw": 452877733553,
+          "category": "partial_low",
+          "difference_raw": 38,
+          "expected_raw": 452877733515,
+          "index": 18617,
+          "inputs": {
+            "averaging_time": "604035796124",
+            "fixed_average": "145782329176569",
+            "fixed_weight": "245309620828",
+            "k": "130680253310946",
+            "q": "16059513348",
+            "r": "15823130492",
+            "s": "137792200619658",
+            "sigma": "788653101821",
+            "t": "1538394964355"
+          }
+        },
+        "expected_mean": {
+          "actual_raw": 498670997660764,
+          "category": "unseasoned",
+          "difference_raw": 55,
+          "expected_raw": 498670997660819,
+          "index": 42548,
+          "inputs": {
+            "averaging_time": "219516793607",
+            "fixed_average": "0",
+            "fixed_weight": "0",
+            "k": "406741035971315",
+            "q": "24849590364",
+            "r": "71746527580",
+            "s": "472431746119126",
+            "sigma": "120405307691",
+            "t": "1262261278853"
+          }
+        },
+        "expected_put": {
+          "actual_raw": 125668667907,
+          "category": "partial_high",
+          "difference_raw": 22580,
+          "expected_raw": 125668645327,
+          "index": 73998,
+          "inputs": {
+            "averaging_time": "27155779124",
+            "fixed_average": "490348271125054",
+            "fixed_weight": "783463001134",
+            "k": "491004255994972",
+            "q": "41549074800",
+            "r": "19922217555",
+            "s": "498985480275581",
+            "sigma": "95483712338",
+            "t": "33551608118"
+          }
+        }
+      },
+      "metrics": {
+        "call": {
+          "max_raw": 22580,
+          "max_real": 2.258e-08,
+          "median_raw": 29,
+          "p95_raw": 634,
+          "p99_raw": 1180
+        },
+        "log_variance": {
+          "max_raw": 38,
+          "max_real": 3.8e-11,
+          "median_raw": 0,
+          "p95_raw": 1,
+          "p99_raw": 1
+        },
+        "mean": {
+          "max_raw": 55,
+          "max_real": 5.5e-11,
+          "median_raw": 0,
+          "p95_raw": 5,
+          "p99_raw": 14
+        },
+        "put": {
+          "max_raw": 22580,
+          "max_real": 2.258e-08,
+          "median_raw": 29,
+          "p95_raw": 633,
+          "p99_raw": 1180
+        }
+      },
+      "reference": "mpmath 1.4.1, 60 decimal digits, independent continuous-GBM moment match",
+      "vectors": 100000
+    },
+    {
+      "accepted": 10000,
+      "category_max_raw": {
+        "carry_raw_seam": {
+          "expected_call": 3949,
+          "expected_log_variance": 2,
+          "expected_mean": 1,
+          "expected_put": 3950
+        },
+        "deep_tail_low_vol": {
+          "expected_call": 79,
+          "expected_log_variance": 2,
+          "expected_mean": 87,
+          "expected_put": 91
+        },
+        "fixing_weight_seam": {
+          "expected_call": 2920,
+          "expected_log_variance": 7,
+          "expected_mean": 82,
+          "expected_put": 2921
+        },
+        "fully_fixed": {
+          "expected_call": 1,
+          "expected_log_variance": 0,
+          "expected_mean": 0,
+          "expected_put": 2
+        },
+        "future_start": {
+          "expected_call": 3086,
+          "expected_log_variance": 2,
+          "expected_mean": 4,
+          "expected_put": 3086
+        },
+        "high_variance": {
+          "expected_call": 3965,
+          "expected_log_variance": 50,
+          "expected_mean": 77,
+          "expected_put": 3966
+        },
+        "partial_fixing_cdf_sensitivity": {
+          "expected_call": 19587949,
+          "expected_log_variance": 1,
+          "expected_mean": 1,
+          "expected_put": 19587949
+        },
+        "series_above": {
+          "expected_call": 8518,
+          "expected_log_variance": 2,
+          "expected_mean": 80,
+          "expected_put": 8517
+        },
+        "series_below": {
+          "expected_call": 4577,
+          "expected_log_variance": 1,
+          "expected_mean": 61,
+          "expected_put": 4599
+        },
+        "tiny_window": {
+          "expected_call": 3406,
+          "expected_log_variance": 1,
+          "expected_mean": 2,
+          "expected_put": 3406
+        },
+        "zero_carry": {
+          "expected_call": 3573,
+          "expected_log_variance": 1,
+          "expected_mean": 0,
+          "expected_put": 3573
+        }
+      },
+      "error_count": 0,
+      "errors": [],
+      "file": "benchmark/adv_asian_vectors.json",
+      "max_cases": {
+        "expected_call": {
+          "actual_raw": 2660563740,
+          "category": "partial_fixing_cdf_sensitivity",
+          "difference_raw": 19587949,
+          "expected_raw": 2640975791,
+          "index": 8278,
+          "inputs": {
+            "averaging_time": "10541470976",
+            "fixed_average": "953502354017465",
+            "fixed_weight": "997626820179",
+            "k": "953327576600744",
+            "q": "50527678659",
+            "r": "11734747999",
+            "s": "880867502150846",
+            "sigma": "27259966587",
+            "t": "11377974106"
+          }
+        },
+        "expected_log_variance": {
+          "actual_raw": 14003948971929,
+          "category": "high_variance",
+          "difference_raw": 50,
+          "expected_raw": 14003948971979,
+          "index": 7894,
+          "inputs": {
+            "averaging_time": "606760923477",
+            "fixed_average": "255839965359635",
+            "fixed_weight": "314649615796",
+            "k": "486750025554448",
+            "q": "38592240777",
+            "r": "39077716176",
+            "s": "336330286976840",
+            "sigma": "5146857321883",
+            "t": "734757683618"
+          }
+        },
+        "expected_mean": {
+          "actual_raw": 910423895608520,
+          "category": "deep_tail_low_vol",
+          "difference_raw": 87,
+          "expected_raw": 910423895608433,
+          "index": 6633,
+          "inputs": {
+            "averaging_time": "228149398874",
+            "fixed_average": "0",
+            "fixed_weight": "0",
+            "k": "6908170690080383",
+            "q": "168725954542",
+            "r": "119810853400",
+            "s": "915513487609572",
+            "sigma": "30715248600",
+            "t": "228149398874"
+          }
+        },
+        "expected_put": {
+          "actual_raw": 754159326,
+          "category": "partial_fixing_cdf_sensitivity",
+          "difference_raw": 19587949,
+          "expected_raw": 734571377,
+          "index": 8278,
+          "inputs": {
+            "averaging_time": "10541470976",
+            "fixed_average": "953502354017465",
+            "fixed_weight": "997626820179",
+            "k": "953327576600744",
+            "q": "50527678659",
+            "r": "11734747999",
+            "s": "880867502150846",
+            "sigma": "27259966587",
+            "t": "11377974106"
+          }
+        }
+      },
+      "metrics": {
+        "call": {
+          "max_raw": 19587949,
+          "max_real": 1.9587949e-05,
+          "median_raw": 129,
+          "p95_raw": 67666,
+          "p99_raw": 1220288
+        },
+        "log_variance": {
+          "max_raw": 50,
+          "max_real": 5e-11,
+          "median_raw": 0,
+          "p95_raw": 1,
+          "p99_raw": 2
+        },
+        "mean": {
+          "max_raw": 87,
+          "max_real": 8.7e-11,
+          "median_raw": 0,
+          "p95_raw": 12,
+          "p99_raw": 31
+        },
+        "put": {
+          "max_raw": 19587949,
+          "max_real": 1.9587949e-05,
+          "median_raw": 129,
+          "p95_raw": 67667,
+          "p99_raw": 1220288
+        }
+      },
+      "reference": "mpmath 1.4.1, 60 decimal digits, independent continuous-GBM moment match",
+      "vectors": 10000
+    }
+  ],
+  "scale": 1000000000000,
+  "total_errors": 0,
+  "total_vectors": 110000
+}

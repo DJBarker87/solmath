@@ -1,0 +1,10 @@
+# Certificate environment: CPython 3.12, Linux x86_64 CI or macOS arm64,
+# binary wheels only. Each accepted wheel is hash-locked.
+numpy==2.4.2 \
+    --hash=sha256:9e35d3e0144137d9fdae62912e869136164534d64a169f86438bc9561b6ad49f \
+    --hash=sha256:b3a24467af63c67829bfaa61eecf18d5432d4f11992688537be59ecd6ad32f5e
+python-flint==0.8.0 \
+    --hash=sha256:af60dbed2b0e3bedef2875ff3a2b32afec12f7152595d65fcd674713ac09a208 \
+    --hash=sha256:884a75da741e4ebbfdf5c638629d9e8a34f5bbbbb315b815b08a7d664f7720b2
+mpmath==1.4.1 \
+    --hash=sha256:dc4f0ea2304480d4a9a48a94c1020571558ade522b44a6912efac63a586e140f

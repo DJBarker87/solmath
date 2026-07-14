@@ -1,6 +1,7 @@
+use crate::arithmetic::{fp_div_i, fp_mul_i, fp_mul_i_round, fp_sqrt};
 use crate::constants::*;
 use crate::error::SolMathError;
-use crate::arithmetic::{fp_mul_i, fp_mul_i_round, fp_div_i, fp_div_i_round, fp_sqrt};
+use crate::norm_cdf_coeffs::*;
 use crate::transcendental::{exp_fixed_i, ln_fixed_i};
 
 /// Standard normal PDF: phi(x) = (1/sqrt(2*pi)) * exp(-x^2/2) at SCALE.
@@ -10,10 +11,17 @@ use crate::transcendental::{exp_fixed_i, ln_fixed_i};
 /// - **Errors**: `Overflow` on internal arithmetic overflow (extremely unlikely).
 /// - **Accuracy**: max 2 ULP.
 pub fn norm_pdf(x: i128) -> Result<i128, SolMathError> {
+    // Extreme |x|: the pdf underflows to 0 long before 9σ. Short-circuit
+    // before squaring so huge |x| (up to i128::MIN/MAX) returns Ok(0) as
+    // documented instead of an internal Overflow. Written as two compares —
+    // x.abs() would overflow for x == i128::MIN.
+    if x > 9 * SCALE_I || x < -9 * SCALE_I {
+        return Ok(0);
+    }
     let x_sq = fp_mul_i(x, x)?;
-    // x_sq ∈ [0, 64·SCALE_I²/SCALE_I] = [0, ~64·SCALE_I] after fp_mul_i; /2 and negate: result ∈ [-32·SCALE_I, 0], fits i128.
+    // |x| ≤ 9·SCALE_I after the guard, so x_sq ≤ 81·SCALE_I; /2 and negate: result ∈ [-41·SCALE_I, 0], fits i128.
     let neg_half_x_sq = -(x_sq / 2);
-    // Guard: for extreme |x|, -x²/2 underflows past exp's range → pdf is 0.
+    // Guard: for 8.94 < |x| ≤ 9, -x²/2 underflows past exp's range → pdf is 0.
     if neg_half_x_sq < -40 * SCALE_I {
         return Ok(0);
     }
@@ -25,77 +33,195 @@ pub fn norm_pdf(x: i128) -> Result<i128, SolMathError> {
     fp_mul_i(INV_SQRT_2PI, exp_term)
 }
 
-/// Rounding Horner degree-11. Uses fp_mul_i_round instead of fp_mul_i.
-#[inline]
-pub(crate) fn horner_11_round(c: &[i128; 12], t: i128) -> Result<i128, SolMathError> {
-    let mut r = c[11];
-    // Each step: fp_mul_i_round result ∈ [-SCALE_I, SCALE_I] (r and t are both ≤ SCALE_I after initial
-    // coefficient), coefficients |c[i]| ≤ SCALE_I; sum ∈ [-2·SCALE_I, 2·SCALE_I], fits i128.
-    r = fp_mul_i_round(r, t)? + c[10];
-    r = fp_mul_i_round(r, t)? + c[9];
-    r = fp_mul_i_round(r, t)? + c[8];
-    r = fp_mul_i_round(r, t)? + c[7];
-    r = fp_mul_i_round(r, t)? + c[6];
-    r = fp_mul_i_round(r, t)? + c[5];
-    r = fp_mul_i_round(r, t)? + c[4];
-    r = fp_mul_i_round(r, t)? + c[3];
-    r = fp_mul_i_round(r, t)? + c[2];
-    r = fp_mul_i_round(r, t)? + c[1];
-    r = fp_mul_i_round(r, t)? + c[0];
-    Ok(r)
-}
-
-/// Rounding map: (|x| - mid) × SCALE / hw, rounded to nearest.
-#[inline]
-pub(crate) fn poly_map_t_round(ax: i128, mid: i128, hw: i128) -> Result<i128, SolMathError> {
-    // ax ∈ [0, 8·SCALE_I], mid ∈ [0, 5·SCALE_I]: ax - mid ∈ [-5·SCALE_I, 8·SCALE_I], fits i128.
-    // checked_mul guards the ×SCALE_I step. hw/2: hw is a small constant ≤ SCALE_I, fits i128.
-    let num = (ax - mid).checked_mul(SCALE_I).ok_or(SolMathError::Overflow)?;
-    Ok(if num >= 0 { (num + hw / 2) / hw } else { (num - hw / 2) / hw })
-}
-
-/// Mills ratio via 6-level continued fraction. For |x| ≥ 5 at SCALE.
-/// At x=5, CF6 vs CF8 difference is < 0.001 ULP. Saves ~2K CU.
-#[inline]
-pub(crate) fn mills_ratio_cf6(x: i128) -> Result<i128, SolMathError> {
-    let mut r = 0i128;
-    for k in (1..=6).rev() {
-        // k ∈ [1, 6], SCALE_I = 1e12: k * SCALE_I ≤ 6e12, fits i128.
-        // r is the previous continued-fraction level (bounded by SCALE_I); x ∈ [5·SCALE_I, 8·SCALE_I];
-        // x + r ≤ 9·SCALE_I, fits i128.
-        r = fp_div_i_round(k * SCALE_I, x + r)?;
+#[inline(always)]
+fn round_shift_cdf(value: i128) -> i64 {
+    const HALF: i128 = 1i128 << (CDF_T_Q - 1);
+    if value >= 0 {
+        ((value + HALF) >> CDF_T_Q) as i64
+    } else {
+        -(((-value + HALF) >> CDF_T_Q) as i64)
     }
-    fp_div_i_round(SCALE_I, x + r)
 }
 
-/// Tail CDF for |x| >= 5×SCALE via asymptotic expansion.
-/// Φ(x) = SCALE − φ(x) × mills_ratio(x). Naturally monotone.
-pub(crate) fn norm_cdf_tail(x_abs: i128) -> Result<i128, SolMathError> {
-    // φ(x) = exp(-x²/2) / √(2π)
-    // x_abs ∈ [5·SCALE_I, 8·SCALE_I]; fp_mul_i_round result ∈ [0, 64·SCALE_I]; /2: ∈ [0, 32·SCALE_I], fits i128.
-    let x_sq_half = fp_mul_i_round(x_abs, x_abs)? / 2;
-    if x_sq_half > 40 * SCALE_I {
-        return Ok(SCALE_I);
+#[inline]
+fn horner_guard_q44<const N: usize>(coefficients: &[i64; N], t: i64) -> i64 {
+    let mut result = coefficients[N - 1];
+    for coefficient in coefficients[..N - 1].iter().rev() {
+        result = round_shift_cdf(result as i128 * t as i128) + coefficient;
     }
-    let exp_val = exp_fixed_i(-x_sq_half)?;
-    let pdf = fp_mul_i_round(INV_SQRT_2PI, exp_val)?;
+    let half = 1i64 << (CDF_COEFF_GUARD_Q - 1);
+    if result >= 0 {
+        (result + half) >> CDF_COEFF_GUARD_Q
+    } else {
+        -((-result + half) >> CDF_COEFF_GUARD_Q)
+    }
+}
 
-    // tail = φ(x) × R(x)
-    let mills = mills_ratio_cf6(x_abs)?;
-    let tail = fp_mul_i_round(pdf, mills)?;
+/// Evaluate a guarded CDF polynomial and its derivative with respect to its
+/// normalized coordinate.  The value path is deliberately bit-for-bit the
+/// same Horner recurrence as `horner_guard_q44`.
+#[inline]
+fn horner_guard_q44_with_derivative<const N: usize>(coefficients: &[i64; N], t: i64) -> (i64, i64) {
+    let mut value = coefficients[N - 1];
+    let mut derivative = 0i64;
+    for coefficient in coefficients[..N - 1].iter().rev() {
+        derivative = round_shift_cdf(derivative as i128 * t as i128) + value;
+        value = round_shift_cdf(value as i128 * t as i128) + coefficient;
+    }
+    let half = 1i64 << (CDF_COEFF_GUARD_Q - 1);
+    let rounded_value = if value >= 0 {
+        (value + half) >> CDF_COEFF_GUARD_Q
+    } else {
+        -((-value + half) >> CDF_COEFF_GUARD_Q)
+    };
+    (rounded_value, derivative)
+}
 
-    // tail ∈ [0, SCALE_I] (pdf and mills both bounded); SCALE_I - tail ∈ [0, SCALE_I], fits i128.
-    Ok((SCALE_I - tail).clamp(0, SCALE_I))
+/// Tail Horner evaluation with 16 evaluation-only guard bits.
+///
+/// The stored coefficients remain Q23 i64 values. Promoting them to Q39 in
+/// an i64 accumulator prevents sub-raw tail increments from wobbling across a
+/// final rounding threshold, without increasing the coefficient payload or
+/// changing the common body path.
+#[inline]
+fn horner_tail_guard_q44<const N: usize>(coefficients: &[i64; N], t: i64) -> i64 {
+    let mut result = coefficients[N - 1] << CDF_TAIL_EVAL_EXTRA_Q;
+    for coefficient in coefficients[..N - 1].iter().rev() {
+        result =
+            round_shift_cdf(result as i128 * t as i128) + (*coefficient << CDF_TAIL_EVAL_EXTRA_Q);
+    }
+
+    const OUTPUT_Q: u32 = CDF_COEFF_GUARD_Q + CDF_TAIL_EVAL_EXTRA_Q;
+    const OUTPUT_HALF: i64 = 1i64 << (OUTPUT_Q - 1);
+    if result >= 0 {
+        (result + OUTPUT_HALF) >> OUTPUT_Q
+    } else {
+        -((-result + OUTPUT_HALF) >> OUTPUT_Q)
+    }
+}
+
+#[inline]
+fn horner_tail_guard_q44_with_derivative<const N: usize>(
+    coefficients: &[i64; N],
+    t: i64,
+) -> (i64, i64) {
+    let mut value = coefficients[N - 1] << CDF_TAIL_EVAL_EXTRA_Q;
+    let mut derivative = 0i64;
+    for coefficient in coefficients[..N - 1].iter().rev() {
+        derivative = round_shift_cdf(derivative as i128 * t as i128) + value;
+        value =
+            round_shift_cdf(value as i128 * t as i128) + (*coefficient << CDF_TAIL_EVAL_EXTRA_Q);
+    }
+    const OUTPUT_Q: u32 = CDF_COEFF_GUARD_Q + CDF_TAIL_EVAL_EXTRA_Q;
+    const OUTPUT_HALF: i64 = 1i64 << (OUTPUT_Q - 1);
+    let rounded_value = if value >= 0 {
+        (value + OUTPUT_HALF) >> OUTPUT_Q
+    } else {
+        -((-value + OUTPUT_HALF) >> OUTPUT_Q)
+    };
+    (rounded_value, derivative)
+}
+
+#[inline(always)]
+fn derivative_to_pdf(derivative: i64, bits: u32, tail: bool) -> i128 {
+    // Every CDF interval has half-width 0.25, hence dx/dt = 0.25 and
+    // d/dx = 4 d/dt.  Tail polynomials approximate Phi(-x), so negate.
+    let signed = if tail {
+        -(derivative as i128)
+    } else {
+        derivative as i128
+    };
+    let value = signed * 4;
+    let half = 1i128 << (bits - 1);
+    let rounded = if value >= 0 {
+        (value + half) >> bits
+    } else {
+        -((-value + half) >> bits)
+    };
+    rounded.clamp(0, SCALE_I)
+}
+
+/// Map `(|x|-mid)/half_width` to Q44 with a Q44 reciprocal guard.
+#[inline(always)]
+pub(crate) fn poly_map_t_q44(ax: i128, mid: i128, hw: i128) -> i64 {
+    // round(2^88 / half_width), followed by a 44-bit shift, produces Q44.
+    // The reciprocal error contributes <0.015 Q44 units at |t|≤1.
+    let reciprocal = match hw {
+        250_000_000_000 => 1_237_940_039_285_380i128,
+        375_000_000_000 => 825_293_359_523_587i128,
+        500_000_000_000 => 618_970_019_642_690i128,
+        // All current callers use one of the three optimized constants above.
+        // Keep the helper total so a future internal caller cannot introduce a
+        // runtime panic. `hw <= 0` maps to zero and is harmless because the
+        // mapped coordinate is used only by fixed, positive-width intervals.
+        _ if hw > 0 => ((1i128 << 88) + hw / 2) / hw,
+        _ => 0,
+    };
+    round_shift_cdf((ax - mid) * reciprocal)
+}
+
+/// Direct positive CDF tail for `5 < x <= 8`.
+#[inline]
+fn norm_cdf_positive_tail(x_abs: i128) -> i128 {
+    let tail = if x_abs <= 11 * SCALE_I / 2 {
+        let t = poly_map_t_q44(x_abs, 21 * SCALE_I / 4, SCALE_I / 4);
+        horner_tail_guard_q44(&NORM_TAIL_50_55_Q23, t)
+    } else if x_abs <= 6 * SCALE_I {
+        let t = poly_map_t_q44(x_abs, 23 * SCALE_I / 4, SCALE_I / 4);
+        horner_tail_guard_q44(&NORM_TAIL_55_60_Q23, t)
+    } else if x_abs <= 13 * SCALE_I / 2 {
+        let t = poly_map_t_q44(x_abs, 25 * SCALE_I / 4, SCALE_I / 4);
+        horner_tail_guard_q44(&NORM_TAIL_60_65_Q23, t)
+    } else if x_abs <= 7 * SCALE_I {
+        let t = poly_map_t_q44(x_abs, 27 * SCALE_I / 4, SCALE_I / 4);
+        horner_tail_guard_q44(&NORM_TAIL_65_70_Q23, t)
+    } else if x_abs <= NORM_TAIL_HALF_RAW_CUTOFF {
+        1
+    } else {
+        0
+    };
+    SCALE_I - tail.clamp(0, SCALE_I as i64) as i128
+}
+
+#[inline]
+fn norm_cdf_positive_tail_and_pdf(x_abs: i128) -> (i128, i128) {
+    const TAIL_Q: u32 = CDF_COEFF_GUARD_Q + CDF_TAIL_EVAL_EXTRA_Q;
+    let (tail, derivative) = if x_abs <= 11 * SCALE_I / 2 {
+        let t = poly_map_t_q44(x_abs, 21 * SCALE_I / 4, SCALE_I / 4);
+        horner_tail_guard_q44_with_derivative(&NORM_TAIL_50_55_Q23, t)
+    } else if x_abs <= 6 * SCALE_I {
+        let t = poly_map_t_q44(x_abs, 23 * SCALE_I / 4, SCALE_I / 4);
+        horner_tail_guard_q44_with_derivative(&NORM_TAIL_55_60_Q23, t)
+    } else if x_abs <= 13 * SCALE_I / 2 {
+        let t = poly_map_t_q44(x_abs, 25 * SCALE_I / 4, SCALE_I / 4);
+        horner_tail_guard_q44_with_derivative(&NORM_TAIL_60_65_Q23, t)
+    } else if x_abs <= 7 * SCALE_I {
+        let t = poly_map_t_q44(x_abs, 27 * SCALE_I / 4, SCALE_I / 4);
+        horner_tail_guard_q44_with_derivative(&NORM_TAIL_65_70_Q23, t)
+    } else {
+        let tail = if x_abs <= NORM_TAIL_HALF_RAW_CUTOFF {
+            1
+        } else {
+            0
+        };
+        return (SCALE_I - tail, 0);
+    };
+    (
+        SCALE_I - (tail as i128).clamp(0, SCALE_I),
+        derivative_to_pdf(derivative, TAIL_Q, true),
+    )
 }
 
 /// Standard normal CDF: Phi(x) at SCALE.
 ///
-/// 6-piece minimax polynomial + continued-fraction asymptotic tail.
+/// 10-piece guarded body + four direct guarded tail polynomials.
 ///
 /// - **x**: signed fixed-point at `SCALE` (1e12).
 /// - **Returns**: `i128` probability in [0, SCALE_I]. Returns 0 for x < -8*SCALE, SCALE_I for x > 8*SCALE.
 /// - **Errors**: `Overflow` on internal arithmetic overflow (extremely unlikely).
-/// - **Accuracy**: max 4 ULP, 50% exact. Monotone with zero boundary discontinuity.
+/// - **Accuracy**: max 2 ULP on the retained 100K production and 10K
+///   seam-focused adversarial corpora; exactly symmetric and monotone on the
+///   generator's dense interval sweeps.
 pub fn norm_cdf_poly(x: i128) -> Result<i128, SolMathError> {
     if x < -8 * SCALE_I {
         return Ok(0);
@@ -109,41 +235,343 @@ pub fn norm_cdf_poly(x: i128) -> Result<i128, SolMathError> {
 
     let ax = x.abs();
 
-    let cdf_pos = if ax <= POLY_V2_I0_HI {
-        horner_11_round(&POLY_V2_I0, poly_map_t_round(ax, POLY_V2_I0_MID, POLY_V2_I0_HW)?)?
-    } else if ax <= POLY_V2_I1_HI {
-        horner_11_round(&POLY_V2_I1, poly_map_t_round(ax, POLY_V2_I1_MID, POLY_V2_I1_HW)?)?
-    } else if ax <= POLY_V2_I2_HI {
-        horner_11_round(&POLY_V2_I2, poly_map_t_round(ax, POLY_V2_I2_MID, POLY_V2_I2_HW)?)?
-    } else if ax <= POLY_V2_I3_HI {
-        horner_11_round(&POLY_V2_I3, poly_map_t_round(ax, POLY_V2_I3_MID, POLY_V2_I3_HW)?)?
-    } else if ax <= POLY_V2_I4_HI {
-        horner_11_round(&POLY_V2_I4, poly_map_t_round(ax, POLY_V2_I4_MID, POLY_V2_I4_HW)?)?
+    // A balanced decision tree holds the seven degree-8 body pieces to at
+    // most four comparisons.  A sequential chain made upper-body and tail
+    // inputs pay for every earlier interval (~8 CU per comparison on SBF).
+    let cdf_pos = if ax <= 7 * SCALE_I / 2 {
+        if ax <= 3 * SCALE_I / 2 {
+            if ax <= SCALE_I / 2 {
+                horner_guard_q44(
+                    &NORM_CDF_0_05_Q23,
+                    poly_map_t_q44(ax, SCALE_I / 4, SCALE_I / 4),
+                ) as i128
+            } else if ax <= SCALE_I {
+                horner_guard_q44(
+                    &NORM_CDF_05_10_Q23,
+                    poly_map_t_q44(ax, 3 * SCALE_I / 4, SCALE_I / 4),
+                ) as i128
+            } else {
+                horner_guard_q44(
+                    &NORM_CDF_10_15_Q23,
+                    poly_map_t_q44(ax, 5 * SCALE_I / 4, SCALE_I / 4),
+                ) as i128
+            }
+        } else if ax <= 5 * SCALE_I / 2 {
+            if ax <= 2 * SCALE_I {
+                horner_guard_q44(
+                    &NORM_CDF_15_20_Q23,
+                    poly_map_t_q44(ax, 7 * SCALE_I / 4, SCALE_I / 4),
+                ) as i128
+            } else {
+                horner_guard_q44(
+                    &NORM_CDF_20_25_Q23,
+                    poly_map_t_q44(ax, 9 * SCALE_I / 4, SCALE_I / 4),
+                ) as i128
+            }
+        } else if ax <= 3 * SCALE_I {
+            horner_guard_q44(
+                &NORM_CDF_25_30_Q23,
+                poly_map_t_q44(ax, 11 * SCALE_I / 4, SCALE_I / 4),
+            ) as i128
+        } else {
+            horner_guard_q44(
+                &NORM_CDF_30_35_Q23,
+                poly_map_t_q44(ax, 13 * SCALE_I / 4, SCALE_I / 4),
+            ) as i128
+        }
     } else if ax <= 5 * SCALE_I {
-        horner_11_round(&POLY_V2_I5, poly_map_t_round(ax, POLY_V2_I5_MID, POLY_V2_I5_HW)?)?
+        if ax <= 4 * SCALE_I {
+            horner_guard_q44(
+                &NORM_CDF_35_40_Q23,
+                poly_map_t_q44(ax, 15 * SCALE_I / 4, SCALE_I / 4),
+            ) as i128
+        } else if ax <= 9 * SCALE_I / 2 {
+            horner_guard_q44(
+                &NORM_CDF_40_45_Q23,
+                poly_map_t_q44(ax, 17 * SCALE_I / 4, SCALE_I / 4),
+            ) as i128
+        } else {
+            horner_guard_q44(
+                &NORM_CDF_45_50_Q23,
+                poly_map_t_q44(ax, 19 * SCALE_I / 4, SCALE_I / 4),
+            ) as i128
+        }
     } else {
-        // Asymptotic tail: Φ(x) = SCALE − φ(x) × mills_ratio(x)
-        norm_cdf_tail(ax)?
+        norm_cdf_positive_tail(ax)
     };
 
     let cdf_pos = cdf_pos.clamp(0, SCALE_I);
 
     // cdf_pos ∈ [0, SCALE_I] after clamp; SCALE_I - cdf_pos ∈ [0, SCALE_I], fits i128.
-    Ok(if x >= 0 {
-        cdf_pos
+    Ok(if x >= 0 { cdf_pos } else { SCALE_I - cdf_pos })
+}
+
+/// Direct polynomial CDF together with the analytic derivative of the active
+/// CDF piece as an inexpensive PDF approximation.
+///
+/// The CDF result is bit-identical to [`norm_cdf_poly`].  On `|x| <= 5`, the
+/// derived PDF differs from the exponential reference by less than 500 raw
+/// SCALE units (5e-10 absolute).  This path is intended for iterative kernels
+/// such as the American-option smooth-pasting equation, where a full
+/// exponential for every Jacobian sample would dominate compute.
+pub fn norm_cdf_and_pdf_poly(x: i128) -> Result<(i128, i128), SolMathError> {
+    if x < -8 * SCALE_I {
+        return Ok((0, 0));
+    }
+    if x > 8 * SCALE_I {
+        return Ok((SCALE_I, 0));
+    }
+    if x == 0 {
+        return Ok((SCALE_I / 2, INV_SQRT_2PI));
+    }
+
+    macro_rules! body_piece {
+        ($coefficients:expr, $midpoint:expr, $half_width:expr) => {{
+            let t = poly_map_t_q44(x.abs(), $midpoint, $half_width);
+            let (cdf, derivative) = horner_guard_q44_with_derivative($coefficients, t);
+            (
+                cdf as i128,
+                derivative_to_pdf(derivative, CDF_COEFF_GUARD_Q, false),
+            )
+        }};
+    }
+
+    let ax = x.abs();
+    let (cdf_pos, pdf) = if ax <= 7 * SCALE_I / 2 {
+        if ax <= 3 * SCALE_I / 2 {
+            if ax <= SCALE_I / 2 {
+                body_piece!(&NORM_CDF_0_05_Q23, SCALE_I / 4, SCALE_I / 4)
+            } else if ax <= SCALE_I {
+                body_piece!(&NORM_CDF_05_10_Q23, 3 * SCALE_I / 4, SCALE_I / 4)
+            } else {
+                body_piece!(&NORM_CDF_10_15_Q23, 5 * SCALE_I / 4, SCALE_I / 4)
+            }
+        } else if ax <= 5 * SCALE_I / 2 {
+            if ax <= 2 * SCALE_I {
+                body_piece!(&NORM_CDF_15_20_Q23, 7 * SCALE_I / 4, SCALE_I / 4)
+            } else {
+                body_piece!(&NORM_CDF_20_25_Q23, 9 * SCALE_I / 4, SCALE_I / 4)
+            }
+        } else if ax <= 3 * SCALE_I {
+            body_piece!(&NORM_CDF_25_30_Q23, 11 * SCALE_I / 4, SCALE_I / 4)
+        } else {
+            body_piece!(&NORM_CDF_30_35_Q23, 13 * SCALE_I / 4, SCALE_I / 4)
+        }
+    } else if ax <= 5 * SCALE_I {
+        if ax <= 4 * SCALE_I {
+            body_piece!(&NORM_CDF_35_40_Q23, 15 * SCALE_I / 4, SCALE_I / 4)
+        } else if ax <= 9 * SCALE_I / 2 {
+            body_piece!(&NORM_CDF_40_45_Q23, 17 * SCALE_I / 4, SCALE_I / 4)
+        } else {
+            body_piece!(&NORM_CDF_45_50_Q23, 19 * SCALE_I / 4, SCALE_I / 4)
+        }
     } else {
-        SCALE_I - cdf_pos
-    })
+        norm_cdf_positive_tail_and_pdf(ax)
+    };
+
+    let cdf_pos = cdf_pos.clamp(0, SCALE_I);
+    Ok((if x >= 0 { cdf_pos } else { SCALE_I - cdf_pos }, pdf))
 }
 
 /// Combined normal CDF and PDF: returns `(Phi(x), phi(x))` at SCALE.
 ///
+/// The CDF uses its direct piecewise polynomial in every interval. The PDF
+/// performs the only exponential evaluation needed by this fused call.
+///
 /// - **x**: signed fixed-point at `SCALE` (1e12).
 /// - **Returns**: `(i128, i128)` — `(CDF, PDF)` both at `SCALE`. CDF in [0, SCALE_I].
 /// - **Errors**: `Overflow` on internal arithmetic overflow.
-/// - **Accuracy**: CDF max 4 ULP, PDF max 2 ULP.
+/// - **Accuracy**: CDF is bit-identical to `norm_cdf_poly`; PDF is
+///   bit-identical to `norm_pdf` (2 ULP max on the retained corpora).
 pub fn norm_cdf_and_pdf(x: i128) -> Result<(i128, i128), SolMathError> {
     Ok((norm_cdf_poly(x)?, norm_pdf(x)?))
+}
+
+#[cfg(test)]
+mod cdf_tests {
+    use super::*;
+
+    #[test]
+    fn norm_cdf_is_symmetric_at_all_piece_seams() {
+        let seams = [
+            0,
+            SCALE_I / 2,
+            SCALE_I,
+            3 * SCALE_I / 2,
+            2 * SCALE_I,
+            5 * SCALE_I / 2,
+            3 * SCALE_I,
+            7 * SCALE_I / 2,
+            4 * SCALE_I,
+            9 * SCALE_I / 2,
+            5 * SCALE_I,
+            11 * SCALE_I / 2,
+            6 * SCALE_I,
+            13 * SCALE_I / 2,
+            7 * SCALE_I,
+            NORM_TAIL_HALF_RAW_CUTOFF,
+            8 * SCALE_I,
+        ];
+        for seam in seams {
+            for offset in -4_096..=4_096 {
+                let x = seam + offset;
+                let positive = norm_cdf_poly(x).unwrap();
+                let negative = norm_cdf_poly(-x).unwrap();
+                assert_eq!(positive + negative, SCALE_I, "symmetry failed at {x}");
+            }
+        }
+    }
+
+    #[test]
+    fn norm_cdf_is_monotone_at_seams_and_across_domain() {
+        let seams = [
+            -8 * SCALE_I,
+            -NORM_TAIL_HALF_RAW_CUTOFF,
+            -7 * SCALE_I,
+            -13 * SCALE_I / 2,
+            -6 * SCALE_I,
+            -11 * SCALE_I / 2,
+            -5 * SCALE_I,
+            -9 * SCALE_I / 2,
+            -4 * SCALE_I,
+            -7 * SCALE_I / 2,
+            -3 * SCALE_I,
+            -5 * SCALE_I / 2,
+            -2 * SCALE_I,
+            -3 * SCALE_I / 2,
+            -SCALE_I,
+            -SCALE_I / 2,
+            0,
+            SCALE_I / 2,
+            SCALE_I,
+            3 * SCALE_I / 2,
+            2 * SCALE_I,
+            5 * SCALE_I / 2,
+            3 * SCALE_I,
+            7 * SCALE_I / 2,
+            4 * SCALE_I,
+            9 * SCALE_I / 2,
+            5 * SCALE_I,
+            11 * SCALE_I / 2,
+            6 * SCALE_I,
+            13 * SCALE_I / 2,
+            7 * SCALE_I,
+            NORM_TAIL_HALF_RAW_CUTOFF,
+            8 * SCALE_I,
+        ];
+        for seam in seams {
+            let mut previous = norm_cdf_poly(seam - 4_096).unwrap();
+            for x in (seam - 4_095)..=(seam + 4_096) {
+                let value = norm_cdf_poly(x).unwrap();
+                assert!(
+                    value >= previous,
+                    "local inversion at {x}: {value} < {previous}"
+                );
+                previous = value;
+            }
+        }
+
+        let step = 20_000_003i128;
+        let mut x = -8 * SCALE_I;
+        let mut previous = norm_cdf_poly(x).unwrap();
+        while x < 8 * SCALE_I {
+            x = (x + step).min(8 * SCALE_I);
+            let value = norm_cdf_poly(x).unwrap();
+            assert!(
+                value >= previous,
+                "domain inversion at {x}: {value} < {previous}"
+            );
+            previous = value;
+        }
+    }
+
+    #[test]
+    fn norm_cdf_q23_guard_prevents_upper_body_rounding_reversal() {
+        let cases = [
+            (4_971_877_961_316, 999_999_668_462),
+            (4_971_877_961_317, 999_999_668_462),
+            (4_971_877_961_318, 999_999_668_462),
+            (4_971_877_961_319, 999_999_668_463),
+        ];
+        let mut previous = 0;
+        for (x, expected) in cases {
+            let actual = norm_cdf_poly(x).unwrap();
+            assert_eq!(actual, expected, "Q23 regression changed at {x}");
+            assert!(actual >= previous, "Q23 rounding reversal at {x}");
+            previous = actual;
+        }
+    }
+
+    #[test]
+    fn norm_cdf_q39_tail_guard_prevents_rounding_reversal() {
+        let cases = [
+            (5_447_923_820_214, 999_999_974_519),
+            (5_447_923_820_215, 999_999_974_519),
+            (5_447_923_820_216, 999_999_974_520),
+            (5_447_923_820_217, 999_999_974_520),
+            (5_447_923_820_218, 999_999_974_520),
+        ];
+        let mut previous = 0;
+        for (x, expected) in cases {
+            let actual = norm_cdf_poly(x).unwrap();
+            assert_eq!(actual, expected, "Q39 tail regression changed at {x}");
+            assert!(actual >= previous, "Q39 tail rounding reversal at {x}");
+            previous = actual;
+        }
+    }
+
+    #[test]
+    fn fused_cdf_pdf_uses_public_kernels_exactly() {
+        for x in (-9_000..=9_000).step_by(17) {
+            let x = i128::from(x) * 1_000_000_000;
+            assert_eq!(
+                norm_cdf_and_pdf(x).unwrap(),
+                (norm_cdf_poly(x).unwrap(), norm_pdf(x).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn polynomial_pdf_reuses_cdf_exactly_and_tracks_density() {
+        let mut x = -8 * SCALE_I;
+        while x <= 8 * SCALE_I {
+            let (cdf, pdf) = norm_cdf_and_pdf_poly(x).unwrap();
+            assert_eq!(cdf, norm_cdf_poly(x).unwrap(), "CDF changed at {x}");
+            let reference = norm_pdf(x).unwrap();
+            assert!(
+                pdf.abs_diff(reference) <= 600,
+                "polynomial PDF gap at {x}: {pdf} vs {reference}"
+            );
+            x += 1_000_000_000;
+        }
+
+        for seam_half in 0..=14 {
+            let seam = i128::from(seam_half) * SCALE_I / 2;
+            for offset in [-4_096, -1, 0, 1, 4_096] {
+                let x = seam + offset;
+                let (cdf, pdf) = norm_cdf_and_pdf_poly(x).unwrap();
+                assert_eq!(cdf, norm_cdf_poly(x).unwrap(), "CDF seam changed at {x}");
+                assert!(pdf.abs_diff(norm_pdf(x).unwrap()) <= 600);
+            }
+        }
+    }
+
+    #[test]
+    fn norm_cdf_retains_two_ulp_regressions() {
+        let cases = [
+            (499_999_999_979, 691_462_461_267),
+            (-4_079, 499_999_998_373),
+            (-1_491_753_830_411, 67_881_845_760),
+            (-5_754_403_847_342, 4_347),
+        ];
+        for (x, expected) in cases {
+            let actual = norm_cdf_poly(x).unwrap();
+            assert!(
+                actual.abs_diff(expected) <= 2,
+                "CDF regression at {x}: {actual} vs {expected}"
+            );
+        }
+    }
 }
 
 /// BS-guarded CDF+PDF: short-circuits to (0,0)/(SCALE,0) beyond ±8σ. Internal.
@@ -155,15 +583,16 @@ pub(crate) fn norm_cdf_and_pdf_bs_guarded(x: i128) -> Result<(i128, i128), SolMa
     if x >= 8 * SCALE_I {
         return Ok((SCALE_I, 0));
     }
-    Ok((norm_cdf_poly(x)?, norm_pdf(x)?))
+    norm_cdf_and_pdf(x)
 }
 
 /// Degree-7 Horner evaluation with rounding.
 #[inline]
 fn horner_7_round(c: &[i128; 8], r: i128) -> Result<i128, SolMathError> {
     let mut acc = c[7];
-    // Each step: fp_mul_i_round result ∈ [-SCALE_I, SCALE_I]; |c[i]| ≤ SCALE_I;
-    // sum ∈ [-2·SCALE_I, 2·SCALE_I], fits i128.
+    // Each step: |r| ≤ ~1.6·SCALE_I (AS241 branch variables), so 7 Horner steps
+    // scale the accumulator by at most ~1.6^7 ≈ 27×. AS241 coefficients reach
+    // ~6.7e16, so partial sums stay < ~2e18 ≪ i128::MAX (1.7e38).
     acc = fp_mul_i_round(acc, r)? + c[6];
     acc = fp_mul_i_round(acc, r)? + c[5];
     acc = fp_mul_i_round(acc, r)? + c[4];
@@ -178,8 +607,8 @@ fn horner_7_round(c: &[i128; 8], r: i128) -> Result<i128, SolMathError> {
 #[inline]
 fn horner_7_den_round(c: &[i128; 7], r: i128) -> Result<i128, SolMathError> {
     let mut acc = c[6];
-    // Each step: fp_mul_i_round result ∈ [-SCALE_I, SCALE_I]; |c[i]| ≤ SCALE_I;
-    // sum ∈ [-2·SCALE_I, 2·SCALE_I], fits i128.
+    // Same bound as horner_7_round: |r| ≤ ~1.6·SCALE_I and AS241 coefficients
+    // reach ~6.7e16, so partial sums stay < ~2e18 ≪ i128::MAX (1.7e38).
     acc = fp_mul_i_round(acc, r)? + c[5];
     acc = fp_mul_i_round(acc, r)? + c[4];
     acc = fp_mul_i_round(acc, r)? + c[3];
@@ -253,6 +682,10 @@ pub fn inverse_norm_cdf(p: i128) -> Result<i128, SolMathError> {
         };
 
         // ret is a z-score ∈ [0, ~8·SCALE_I]; negation: ∈ (-8·SCALE_I, 0], fits i128.
-        if q < 0 { Ok(-ret) } else { Ok(ret) }
+        if q < 0 {
+            Ok(-ret)
+        } else {
+            Ok(ret)
+        }
     }
 }

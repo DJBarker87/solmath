@@ -1,0 +1,62 @@
+{
+  "method": "compiled Rust Q40 Kim Boundary Integration versus QuantLib QdFp accurateScheme",
+  "runtime_design": "18-node sqrt-time boundary; six-node singularity-cancelled Gaussian history; nine-node QdFp-regularized empirical premium cubature; log-boundary interpolation; all parameter-dependent work on-chain",
+  "quantlib_version": "1.41",
+  "artifact_sha256": "6c0e7857669b9913770de45da32d5cfdeb1d89faf78e7bcdad55d3ee27a218ca",
+  "contract_source": "deterministic held-out sample seed 0x51d3",
+  "contract_count": 24,
+  "moneyness_points_per_contract": 33,
+  "validation_log_moneyness": [
+    -0.75,
+    0.75
+  ],
+  "price_comparisons_per_leg": 792,
+  "absolute_error_dollars_at_100_strike": {
+    "call": {
+      "count": 792,
+      "median": 8.948694253874123e-05,
+      "p95": 0.0010766623458337676,
+      "p99": 0.001726966784826303,
+      "max": 0.0018849224875019388,
+      "mean": 0.0002856895420760865
+    },
+    "put": {
+      "count": 792,
+      "median": 9.380566574179738e-05,
+      "p95": 0.0016180610193870845,
+      "p99": 0.002029547962462673,
+      "max": 0.0020945350702348264,
+      "mean": 0.0004238174604345133
+    }
+  },
+  "worst_cases": {
+    "call": {
+      "contract_index": 23,
+      "contract": {
+        "r": 0.030067242360500648,
+        "q": 0.09809174183039819,
+        "sigma": 0.7031808649252979,
+        "days": 685
+      },
+      "normalized_spot": 0.9542066659691884,
+      "runtime_price_dollars": 27.279214209272,
+      "qdfp_price_dollars": 27.2810991317595,
+      "signed_error_dollars": -0.0018849224875019388,
+      "absolute_error_dollars": 0.0018849224875019388
+    },
+    "put": {
+      "contract_index": 13,
+      "contract": {
+        "r": 0.06851114938869349,
+        "q": 0.1032280972514535,
+        "sigma": 0.9392856045812212,
+        "days": 575
+      },
+      "normalized_spot": 1.7550546569602985,
+      "runtime_price_dollars": 28.078323718546,
+      "qdfp_price_dollars": 28.076229183475764,
+      "signed_error_dollars": 0.0020945350702348264,
+      "absolute_error_dollars": 0.0020945350702348264
+    }
+  }
+}

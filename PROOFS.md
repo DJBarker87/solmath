@@ -7,18 +7,22 @@ least-significant fixed-point unit.
 
 All source references are to files under `src/`.
 
-**Disclaimer:** The methodology and assumptions in this document are sound to the
-author's knowledge, but the proofs themselves were generated with AI assistance and
-have not been independently verified. The discerning reader should reproduce any
-result before relying on it. The empirical benchmarks were run by the author and are
-the primary accuracy reference.
+**Verification status.** The crate uses four distinct evidence layers and labels
+their scope explicitly:
 
-**Certificate script status:** The Lipschitz certificate scripts referenced below
-(`lipschitz_certificate.py`, `trig_lipschitz_certificate.py`) are not included in
-the current crate package. The polynomial certification chain for Propositions 6,
-9, and 10 should be treated as non-reproducible until those scripts are restored
-and re-run against the current source. The empirical benchmark results remain the
-primary accuracy reference.
+1. Bit-precise Kani proofs for core truncation, nearest-rounding, overflow,
+   double-word residuals, U256 limb arithmetic, and square-root bisection.
+2. Source-bound Arb interval certificates for the current `ln_fixed_i`,
+   `exp_fixed_i`, and `norm_cdf_poly` kernels.
+3. Exact-integer and analytical arguments for arithmetic not yet covered by a
+   model-checking harness.
+4. Independent-reference corpora for end-to-end model accuracy.
+
+The current Kani harnesses and Arb entry points are reproducible from this
+repository and enforced by CI. Historical sections that refer to the retired
+`lipschitz_certificate.py` or `trig_lipschitz_certificate.py` scripts do not form
+part of the current source-bound certificate set; this primarily affects the old
+trigonometric and HP-CDF derivations, not the current standard CDF certificate.
 
 -----
 
@@ -102,6 +106,61 @@ division semantics for R3; standard library `i128::checked_mul` documentation fo
 
 -----
 
+## Machine-checked integer core
+
+Kani 0.67.0 model-checks thirteen production-linked integer properties over their
+complete stated state spaces: 545 checks in the current run. The proof code
+lives beside the implementation under
+`#[cfg(kani)]`, so it contributes nothing to the published runtime or program
+binary. CI runs all harnesses with:
+
+```sh
+cargo kani --features full
+```
+
+The harnesses are:
+
+| Harness | Bit-precise result | Production scope |
+|---|---|---|
+| `signed_scale_remainder_is_sub_ulp` | For every `i128` numerator, `abs(n % SCALE) < SCALE`; truncation therefore contributes strictly less than 1 ULP. | Standard-scale signed multiplication/division lemmas. |
+| `remainder_half_comparison_is_exact_and_overflow_free` | `r >= d-r` is exactly equivalent to `2r >= d`, including odd divisors, exact ties, and cases where `2r` overflows `u128`. | Every nearest-rounding helper. |
+| `unsigned_quotient_rounding_is_half_ulp_or_overflow` | For every valid `(q,r,d)`, nearest rounding has error at most 0.5 ULP, ties round up, and `MAX+1` returns overflow. | `fp_mul_round`, `fp_div_round`, `fp_div_i_round`, and the widened branch of `fp_mul_i_round`. |
+| `signed_quotient_rounding_is_half_ulp_or_overflow` | For every valid signed quotient/remainder, nearest rounding has error at most 0.5 ULP, ties round away from zero, and unrepresentable corrections return overflow. | Native-product branch of `fp_mul_i_round`. |
+| `standard_collapse_is_half_ulp_for_every_valid_residual` | Every valid standard-scale `DoubleWord` residual collapses with at most 0.5 ULP error. | Compensated standard-scale kernels. |
+| `hp_collapse_is_half_ulp_for_every_valid_residual` | The same result holds at `SCALE_HP = 10^15`. | Compensated HP kernels. |
+| `checked_add_preserves_the_sub_ulp_residual_invariant` | Exact double-word addition re-normalizes every accepted residual into `(-SCALE, SCALE)`. | Composition of compensated operations before final collapse. |
+| `u256_product_carry_assembly_is_exact` | For every valid tuple of four 64×64 partial products, all four base-2^64 result limbs equal an independent schoolbook-column specification. | `U256::mul_u128` and the shared `wide_mul_u128` square-root comparator. |
+| `u256_div_rem_u64_digit_fits_one_limb` | For every proper incoming remainder, the appended two-limb dividend is strictly below `divisor * 2^64`; its quotient digit therefore fits one limb. | Every transition of `U256::div_rem_u64`. |
+| `knuth_d3_two_corrections_cross_the_base` | For every normalized top divisor limb, two correction transitions necessarily raise `rhat` across base 2^64 without overflow; the D3 loop needs at most two decrements. | Quotient-digit refinement in `U256::div_rem_u128`. |
+| `sqrt_newton_transition_preserves_and_detects_the_floor` | Given the exact quotient inequalities implied by a floor-root bracket, production Newton averaging preserves `candidate >= floor_root`, strictly descends above the floor, and can exit only at the floor. | `isqrt_u128` and the fallback behind fixed-iteration `sqrt_scaled_newton`. |
+| `sqrt_bisection_preserves_the_exact_floor_bracket` | For every valid bracket and midpoint decision, the production transition preserves `low <= floor_root < high` and strictly shrinks the bracket. | Wide bisection in the overflow path of `fp_sqrt`. |
+
+For an exact quotient/remainder pair `x = q + r/d`, the nearest-rounding
+harnesses define the integer error numerator as either `abs(r)` or
+`d - abs(r)`. They prove the overflow-free inequality
+
+```text
+error_numerator <= d - error_numerator
+```
+
+which is equivalent to `2 * error_numerator <= d`, hence an error of at most
+one-half output ULP. This avoids floating-point arithmetic and avoids overflowing
+the proof expression itself.
+
+The rounding harnesses deliberately start at the exact quotient/remainder
+boundary. The widened-arithmetic proof is compositional: **(R1)** supplies exact
+64×64 partial products, the 79-check carry harness proves their 256-bit
+assembly, **(R2)**/**(R3)** supply each primitive quotient/remainder identity,
+and the division harnesses prove the nontrivial limb-fit and Knuth-D3 bounds.
+Lemma 3 gives the induction over all limbs. For square root, the 31-check Newton
+harness proves the production control transition from exact quotient
+inequalities, while exact multiplication makes `midpoint² <= n` equivalent to
+`midpoint <= floor(sqrt(n))` and the 14-check harness proves the wide-bisection
+transition. Polynomial approximation error is separate and is covered by
+source-bound Arb certificates.
+
+-----
+
 ## Lipschitz certificate method
 
 Several Category B results (Proposition 6, Proposition 9, Proposition 10) claim that
@@ -168,22 +227,19 @@ and Proposition 10, and detailed further in the Appendix (Lipschitz certificates
 
 ## Bound classification
 
-Not all bounds in this document have the same epistemological status. Each result
-falls into one of three categories:
+Not all bounds in this document use the same proof mechanism:
 
-|Category                                            |Meaning                                                                                                                                                                                                                                                                                                                                   |Results                                                                                                                                                                                                                           |
-|----------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-|**A — Exact integer proofs**                        |The computation is proven exact (0 error) or the only error is the unavoidable final truncation/rounding remainder, proved from the code's integer arithmetic with no approximation theory involved.                                                                                                                                      |Lemma 1, Proposition 1 Path B, Lemma 3, Lemma 2, Proposition 2, Proposition 3, Proposition 4, Proposition 5                                                                                                                       |
-|**A/B — Exact with analytical convergence argument**|The computation is structurally exact (integer Newton iteration converging to floor(sqrt)), with convergence guaranteed by a standard analytical argument. No approximation theory involved, but the convergence proof is not machine-checked.                                                                                            |Proposition 1 Path A                                                                                                                                                                                                              |
-|**B — Analytical conservative bounds**              |The error bound is derived by summing worst-case contributions from each rounding step in the algorithm. For polynomial approximation results, the minimax approximation error is rigorously certified via Lipschitz analysis. These are genuine analytical arguments but rely on worst-case accumulation that is unlikely to be realized simultaneously.|Proposition 6, Proposition 7, Proposition 8, Proposition 9, Proposition 10, Proposition 11 (restricted domain), Proposition 12                                                                                                    |
+| Category | Meaning | Results |
+|---|---|---|
+| **M — Machine checked** | Bit-precise verification of the compiled Rust control flow and integer properties for every state satisfying the harness preconditions. | The rounding, residual, U256-limb, and square-root transition harnesses listed above. |
+| **A — Exact integer proof** | Exact computation, or only an unavoidable final integer remainder, established algebraically without approximation theory. | Lemmas 1–3; both paths of Proposition 1; Propositions 2–5. |
+| **B — Certified or analytical bound** | Interval-certified approximation error and/or conservative accumulation of rounding contributions. | Propositions 6–12. |
 
-**How to read this document:** Category A bounds are unconditionally reliable — they
-follow from integer arithmetic identities that hold by construction. Category B bounds
-are reliable but conservative; they could in principle be tightened by tracking error
-correlations. For polynomial approximation results (Proposition 6, Proposition 9,
-Proposition 10), the minimax approximation error is rigorously certified via Lipschitz
-analysis (see Appendix for the three-level rigour chain). All bounds are consistent
-with (and significantly more conservative than) empirical benchmarks.
+Category M is the strongest implementation-level evidence but applies only to
+the stated harness boundary. Category A supplies the exact arithmetic premises
+and induction that compose those boundaries into whole-function results.
+Category B covers approximation kernels and is normally more conservative than
+the measured error.
 
 -----
 
@@ -375,18 +431,35 @@ result = trunc((a * b) / c)    exactly (0 error).
 *(A) The 256-bit multiplication is exact.*
 Since `|a| <= 2^127` and `|b| <= 2^127` (both fit in i128), the product
 `|a| * |b| <= 2^254`, which fits in U256 (256 bits). The implementation
-`U256::mul_u128` (`constants.rs:125-146`) performs schoolbook multiplication
-on 64-bit limbs with carry propagation. Each limb multiplication is exact
-by **(R1)** and carry propagation is exact integer addition. No truncation
-or rounding occurs.
+`U256::mul_u128` performs schoolbook multiplication on 64-bit limbs. Each
+partial product fits in u128 and is exact by **(R1)**. Production carry
+propagation is factored through `assemble_u128_product`; the Kani harness
+`u256_product_carry_assembly_is_exact` checks 79 properties over every valid
+four-partial-product state and proves all four limbs equal independent
+base-2^64 schoolbook columns. `wide_mul_u128` delegates to this same production
+multiplier, so the square-root comparator shares the result. No truncation or
+rounding occurs.
 
 *(B) The 256-bit division is exact integer division.*
-`div_rem_u64` (`constants.rs:165-178`) performs long division using 128-bit
-intermediate values for each 64-bit limb. `div_rem_u128` (`constants.rs:181+`)
-performs Knuth's Algorithm D (normalized long division). Both operate on unsigned
-(absolute) values and compute `floor(numerator / divisor)` by **(R2)** and the
-exact remainder by **(R3)**. For unsigned values, floor division and truncation
-toward zero are identical.
+Let `B = 2^64`. `div_rem_u64` applies four production
+`div_rem_u64_step` transitions. If the incoming remainder satisfies `r < d`,
+then the appended dividend `rB + limb < dB`; the Kani harness
+`u256_div_rem_u64_digit_fits_one_limb` verifies that bound over every 64-bit
+state. Hence the quotient digit is below `B`, while **(R2)**/**(R3)** give
+`rB + limb = qd + r'` and `r' < d`. Induction from the initial remainder zero
+proves the four-limb quotient and final remainder exactly.
+
+`div_rem_u128` performs normalized Knuth Algorithm D. Normalization makes the
+top divisor limb at least `B/2`. The production D3 correction is factored into
+`advance_knuth_refinement`; the 45-check
+`knuth_d3_two_corrections_cross_the_base` harness proves that, if a second
+correction is needed, it necessarily raises `rhat` across `B`, so the loop is
+bounded by two decrements and its additions/subtractions remain representable.
+The subsequent multiply-subtract and possible add-back are the standard exact
+Algorithm-D limb transitions under **(R1)**–**(R3)**. In test builds every
+optimized result is also asserted equal to the independent 256-step restoring
+long-division reference in `overflow.rs`. Both division paths therefore compute
+the unsigned floor quotient and exact proper remainder.
 
 *(C) Sign correction is exact.*
 Negation of an integer is exact in two's complement, with the one edge case
@@ -429,10 +502,11 @@ Ordered so that each result depends only on lemmas and propositions already stat
 |fp_sqrt(x) - sqrt(x * SCALE)| < 1 ULP.
 ```
 
-**Classification.** Path B is Category A (exact by 256-bit bisection). Path A is
-Category A/B: the algorithm is structurally exact (integer Newton iteration converging
-to floor(sqrt)), with convergence guaranteed by a standard analytical argument that
-is not machine-checked. Both paths are empirically validated to < 1 ULP on all tested inputs.
+**Classification.** Both paths are Category A. Fixed-iteration Newton remains
+the fast candidate generator, but a release feasibility certificate and an
+exact monotonically convergent integer-Newton fallback make correctness
+independent of the fixed iteration count. The Newton control transition and the
+wide-bisection transition are machine-checked over their complete stated spaces.
 
 **Implementation.** Two code paths depending on whether `x * SCALE` fits in u128:
 
@@ -446,6 +520,9 @@ is not machine-checked. Both paths are empirically validated to < 1 ULP on all t
 1. Initial guess: `g = 1 << ((bit_len + 1) / 2)` where `bit_len = 128 - scaled.leading_zeros()`
 1. Up to 8 Newton-Raphson iterations: `g_new = (g + scaled / g) / 2`
 1. Early termination when `g_new == g` or `g_new + 1 == g`; returns `min(g, g_new)`
+1. Verify `g² <= scaled`. Every Newton transition preserves
+   `g >= floor(sqrt(scaled))`, so this one-sided feasibility test proves equality.
+   If it does not hold, restart with exact convergent `isqrt_u128`.
 
 **Path B** (overflow, `arithmetic.rs:229-262`): When `x * SCALE` overflows u128:
 
@@ -469,6 +546,8 @@ error, but this only affects the initial approximation for the bisection.
 `low = max { r : r^2 <= x * SCALE }`, where the comparison `r^2 <= x * SCALE` is
 performed in exact 256-bit arithmetic via `cmp_sqrt_candidate(mid, x)`, which
 computes `wide_mul(mid, mid)` vs `wide_mul(x, SCALE)` with no overflow.
+`wide_mul_u128` delegates to the same `U256::mul_u128` carry assembly covered by
+the 79-check multiplication harness.
 
 *(C) Termination.* The binary search terminates when `low + 1 == high`, which
 means `low^2 <= x*SCALE < (low+1)^2`. This is exactly the condition
@@ -477,58 +556,49 @@ means `low^2 <= x*SCALE < (low+1)^2`. This is exactly the condition
 *(D) Error.* Path B returns `floor(sqrt(x * SCALE))` exactly. The error satisfies
 `sqrt(x * SCALE) - floor(sqrt(x * SCALE)) ∈ [0, 1)`. □ (Path B)
 
-*Proof of Path A (Category A/B — analytical convergence).*
+*Proof of Path A (Category A — certified exact fallback).*
 
 *(A) Scaling.* The product `scaled = x * SCALE` is exact by **(R1)**, since the
 checked multiply confirms no overflow.
 
-*(B) Overestimate.* The initial guess is `g_0 = 2^(ceil(bit_len/2))`. Since
-`2^(ceil(log2(n)/2)) >= sqrt(n)` for all n > 0, the initial guess satisfies
-`g_0 >= sqrt(scaled)`.
+*(B) Newton lower-bound invariant.* Let `s = floor(sqrt(scaled))` and let the
+current positive candidate be `g >= s`. Since `scaled >= s²`,
 
-*(C) Monotone convergence.* Each iteration computes
-`g_{k+1} = floor((g_k + scaled/g_k) / 2)` by **(R2)**. For any g > floor(sqrt(n)),
-the integer iteration `floor((g + floor(n/g)) / 2)` is strictly less than g — this
-is the key property that makes integer Newton iteration terminate. The floor operations
-in integer division do not break monotone convergence; they ensure it. The sequence is
-non-increasing for k >= 1 and converges to floor(sqrt(scaled)). (This is a standard
-result; see Cohen, *A Course in Computational Algebraic Number Theory*, §1.7.1.)
-
-*(D) Convergence rate.* Let `m = bit_len` so that `2^(m-1) <= scaled < 2^m`.
-The true root satisfies `sqrt(scaled) >= 2^((m-1)/2)`. Therefore:
-
-```
-g_0 / sqrt(scaled) <= 2^(ceil(m/2)) / 2^((m-1)/2) = 2^(ceil(m/2) - (m-1)/2)
+```text
+g + floor(scaled / g) >= 2s,
 ```
 
-For even m: `ceil(m/2) - (m-1)/2 = 1/2`, so `g_0/sqrt(scaled) <= sqrt(2) < 2`.
-For odd m: `ceil(m/2) - (m-1)/2 = 1`, so `g_0/sqrt(scaled) <= 2`.
-In both cases, `g_0 / sqrt(scaled) <= 2`. The first iteration yields:
+so `floor((g + floor(scaled/g))/2) >= s`. Thus every production averaging
+transition and the early `min(g, g_new)` preserve `g >= s`. The 31-check harness
+`sqrt_newton_transition_preserves_and_detects_the_floor` machine-checks the
+averaging, preservation, and exit control over every state satisfying these
+exact quotient inequalities.
 
-```
-g_1/sqrt(scaled) - 1 <= (g_0/sqrt(scaled) - 1)^2 / (2 * g_0/sqrt(scaled)) <= 1/4
-```
+*(C) One-sided release certificate.* After the fixed steps, the implementation
+checks `g² <= scaled` with `checked_mul`. The invariant gives `g >= s`, while
+feasibility gives `g <= s`; hence `g = s`. A second successor square is
+unnecessary on the release hot path. Debug builds retain the full two-sided
+certificate.
 
-so `g_1` is within 25% of the root and quadratic convergence applies from k=1
-onwards. After 8 iterations, the relative error is bounded by
-`(0.25)^(2^7) = (0.25)^128 < 10^-77` — far below a single ULP for any 128-bit input.
+*(D) Exact fallback.* If feasibility rejects, `isqrt_u128` restarts from
+`g_0 = 2^ceil(bit_len/2) >= s`. When `g > s`,
+`scaled < (s+1)² <= g²`, so `floor(scaled/g) < g` and the next candidate is
+strictly smaller than `g`, while part (B) keeps it at least `s`. A strictly
+decreasing nonnegative integer sequence terminates. The production exit test is
+`g_new >= g`; the machine-checked control lemma proves that condition cannot
+hold above `s`, so the returned candidate is exactly `s`.
 
-*(E) Termination.* The early termination condition (`g_new == g` or `g_new + 1 == g`)
-detects convergence and returns `min(g, g_new) = floor(sqrt(scaled))`.
-
-*(F) Error.* Path A returns `floor(sqrt(x * SCALE))` exactly. The error satisfies
+*(E) Error.* Path A returns `floor(sqrt(x * SCALE))` exactly. The error satisfies
 `sqrt(x * SCALE) - floor(sqrt(x * SCALE)) ∈ [0, 1)`. □ (Path A)
 
 **Combined.** In both paths, `f-hat(x) = floor(sqrt(x * SCALE))` and the error
 `|f-hat(x) - f(x)| = sqrt(x*SCALE) - floor(sqrt(x*SCALE))` lies in [0, 1).
 Therefore **|f-hat(x) - f(x)| < 1 ULP** for all valid x. □
 
-*Remark (Post-check).* A `debug_assert!` post-check already exists at
-`arithmetic.rs:186-191`, verifying `g * g <= scaled && (g+1) * (g+1) > scaled`.
-This catches convergence failures during development and testing. Promoting it to
-an unconditional `assert!` would upgrade Path A to Category A (the output would be
-verifiably correct regardless of convergence analysis), at the cost of a small CU
-increase in production.
+*Remark (Fast-path cost).* One checked square executes in release builds. The
+fallback reuses the crate's existing integer-Newton kernel and runs only if the
+fixed candidate is infeasible; the proof upgrade does not add a second dense
+square-root engine.
 
 *Remark (Empirical validation).* Max observed error = 1 ULP across benchmark vectors
 (production suite: fp_sqrt max ULP = 1 across 100K vectors). The ≤ 1 ULP
@@ -677,18 +747,49 @@ and floor = ceil. □
 
 ### Proposition 6 (norm_cdf_poly — standard-scale normal CDF)
 
-**Source:** `normal.rs:80-117`
+**Source:** `normal.rs`, `norm_cdf_coeffs.rs`
 
-**Classification:** Category B — Lipschitz-certified approximation error plus
-analytical implementation overhead.
+**Classification:** Category B — rigorous Arb interval certificate plus exact
+integer/rational analysis of every implementation case.
 
-**Statement.** For all x in [-8*SCALE, 8*SCALE],
+**Current implementation (2026-07-12).** Ten guarded half-sigma body
+polynomials (degree 8/7) and four direct tail polynomials (degrees 6/5/4/3)
+use Q44 arguments and a balanced dispatch tree. Coefficients are stored at Q23;
+the body evaluates at Q23 and the tail promotes the same stored coefficients to
+Q39 in a proved-safe `i64` accumulator. The standalone CDF performs no
+exponential or division and retains a 936-byte coefficient/cutoff payload.
 
+**All-input theorem.** For every `x: i128`, let
+`y = SCALE * Phi(x / SCALE)` and let `R(y)` be a nearest integer. The checker
+`scripts/certify_norm_cdf.py`, using `python-flint==0.8.0`/Arb at 256-bit
+working precision, proves
+
+```text
+|norm_cdf_poly(x) - y| < 2.393618011670762 raw units
+|norm_cdf_poly(x) - R(y)| <= 2 integer ULP.
 ```
-|norm_cdf_poly(x) - Phi(x/SCALE) * SCALE| <= 9 ULP,
-```
 
-where Φ is the standard normal CDF.
+It also proves exact symmetry wherever negation is representable, safe handling
+of `i128::MIN`, and nondecreasing output over the complete discrete `i128`
+domain. All fourteen exact quantized polynomials have a strict derivative sign;
+their minimum adjacent-input increment exceeds the complete rounded-Horner
+uncertainty. Sixteen center/seam/cutoff transitions are checked exactly, and
+Arb proves the one-to-zero raw tail transition. Every map multiply, body `i64`
+accumulator, Q39 tail `i64` accumulator, `i128` product, half-rounding addition,
+clamp, and symmetry subtraction is width-checked.
+
+Constructing the proof found two genuine one-ULP monotonicity reversals that
+the former 110,000 vectors and dense sweep missed: one in the Q20 upper body and
+one in the initial tail after the Q23 body repair. The final Q23-body/Q39-tail
+kernel removes both structurally and retains exact compiled regressions.
+
+**Retained empirical result.** The final 100,000-vector production and 10,000-
+vector seam/tail adversarial corpora still measure 2 ULP maximum. The complete
+certificate, per-piece bounds, source digests, discrete proof, and limitations
+are in `.superstack/norm-cdf-proof-2026-07-12.md` and its JSON companion.
+
+<details>
+<summary>Historical six-piece/continued-fraction proof (superseded; not applicable to the current code)</summary>
 
 **Certificate summary** (`lipschitz_certificate.py`, 100K grid points/piece,
 mpmath 60-digit precision):
@@ -816,22 +917,50 @@ are negligible relative to 1 ULP. The clamp to [0, SCALE_I] ensures safety.
 *Remark (Empirical validation).* Max observed error = 4 ULP across 100K production
 vectors (production suite: norm_cdf_poly max ULP = 4).
 
+</details>
+
 -----
 
 ### Proposition 7 (ln_fixed_i — fixed-point natural logarithm)
 
-**Source:** `transcendental.rs:11-87`
+**Source:** `transcendental.rs`, `ln_lut.rs`, `ln2_lut.rs`
 
-**Classification:** Category B — analytical conservative bound with sub-ULP
-correction chain.
+**Classification:** Category B — rigorous Arb interval certificate plus exact
+integer/rational analysis of every implementation case.
 
-**Statement.** For all x > 0 where the result fits in i128,
+**Current implementation (2026-07-12).** `ln_fixed_i` and `ln_1p_fixed` share
+a 1,024-segment Q42 midpoint kernel. Binary normalization maps to `[1,2)`, an
+exact 64-bit index selects a midpoint/log/reciprocal, and
+`q - q²/2 + q³/3` supplies the local correction.
 
+**All-input theorem.** For every `x` in `1..=u128::MAX`, let
+`y = SCALE * ln(x / SCALE)` and let `R(y)` be a nearest integer. The checker
+`scripts/certify_ln_fixed.py`, using `python-flint==0.8.0`/Arb at 100 decimal
+digits, proves
+
+```text
+|ln_fixed_i(x) - y| < 2.925564 raw units
+|ln_fixed_i(x) - R(y)| <= 3 integer ULP.
 ```
-|ln_fixed_i(x) - ln(x / SCALE) * SCALE| <= 3 ULP.
-```
 
-Returns `Err(DomainError)` for x = 0.
+It proves the near-one shortcut separately at `< 0.5` raw units and the
+`m == SCALE` branch at `< 1.499803`. It covers all 128 input bit lengths, 253
+exhaustive normalization intervals, every reachable exponent `k=-40..88`, all
+1,024 midpoint segments, 132,096 segment/exponent pairs, every stored constant,
+every fixed-point rounding/truncation step, discarded normalization bits, and
+all relevant integer-overflow bounds. The proof is pinned to a digest of the
+exact Rust kernel bodies, so a kernel edit invalidates the certificate until it
+is reviewed and regenerated.
+
+**Retained empirical result.** The 100,000 production and 10,000 full-width
+adversarial vectors both measured 2 ULP maximum, 1 ULP P99, and zero median.
+The corpus result is tighter than the proved 3-ULP all-input bound. `x = 0`
+returns `Err(DomainError)`. The full certificate, source digests, error
+decomposition, and limitations are recorded in
+`.superstack/ln-proof-certificate-2026-07-12.md` and its JSON companion.
+
+<details>
+<summary>Historical 16-entry arctanh/Remez proof (superseded; not applicable to the current code)</summary>
 
 **Implementation overview.** Table-assisted Remez-polynomial arctanh with 16-entry
 split-constant lookup and combined sub-ULP correction.
@@ -965,132 +1094,88 @@ Rounded to a clean bound: **|f-hat(x) - ln(x/SCALE) * SCALE| <= 3** for all x > 
 *Remark (Empirical validation).* Max observed error = 3 ULP across 100K production
 vectors (production suite: ln_fixed_i max ULP = 3, median 1).
 
+</details>
+
 -----
 
 ### Proposition 8 (exp_fixed_i — fixed-point exponential)
 
-**Source:** `transcendental.rs:93-141`
+**Source:** `src/transcendental.rs` and generated `src/exp_coeffs.rs`.
 
-**Classification:** Category B — analytical conservative bound. Remez rational
-approximation (FreeBSD msun style) with split LN2 correction.
+**Classification:** Category B — source-bound numerical and exact-integer
+certificate. The certificate is reproducible with
+`python3 scripts/certify_exp_fixed.py` and is retained as
+`.superstack/exp-proof-certificate-2026-07-12.{md,json}`.
 
-**Statement.** For all x in [-40*SCALE, 40*SCALE],
-
-```
-|exp_fixed_i(x) - exp(x/SCALE)*SCALE| <= C * 2^k
-```
-
-where k = floor(x / LN2_I) (after correction), C <= 4 ULP in the pre-reconstruction
-sum. The relative error is bounded independently of k:
+**Statement.** For every successful non-saturated input
+`-40*SCALE < x < 40*SCALE`, the certified fixed-point source model has combined
+relative error below
 
 ```
-|f-hat(x) - exp(x/SCALE)*SCALE| / |exp(x/SCALE)*SCALE| < 4*sqrt(2) / SCALE ≈ 5.7 * 10^-12.
+1.54994794363012e-16.
 ```
 
-Returns `Ok(0)` for x <= -40*SCALE, `Err(Overflow)` for x >= 40*SCALE.
+The corresponding conservative absolute raw bounds are 41,159 for `|x| < 20`
+and `2.20965e13` over the full guarded domain. Absolute error grows with the
+reconstructed power of two; relative error is the stable metric. The public
+guards return `Ok(0)` for `x <= -40*SCALE` and `Err(Overflow)` for
+`x >= 40*SCALE`.
 
-**Implementation overview.** Remez rational formula with 7 rounding operations
-(vs 24 in the previous Taylor series).
+**Implementation overview.**
 
-1. **Domain guards** (`transcendental.rs:94-98`): Returns `Ok(0)` for x <= -40*SCALE,
-   `Err(Overflow)` for x >= 40*SCALE, `Ok(SCALE_I)` for x = 0.
-1. **Range reduction with split LN2** (`transcendental.rs:103-117`):
-   - `k = x / LN2_I` — initial octave estimate
-   - `ln2_correction = round(k * LN2_LO / SCALE_I)` — sub-ULP residual correction.
-     `LN2_I` overshoots true `ln(2)*SCALE` (since `LN2_LO < 0`), so `k*LN2_I` is too
-     large and `r = x - k*LN2_I` is too small. The correction adds back the deficit.
-   - `r = x - k * LN2_I - ln2_correction` — reduced argument
-   - Boundary adjustment: if `|r| > LN2_I/2`, adjust k by ±1 and r by ∓LN2_I
-   - After reduction: `|r/SCALE| <= ln(2)/2 ≈ 0.347`
-1. **Remez rational formula** (`transcendental.rs:120-133`):
-   - `xx = fp_mul_i_round(r, r)` — r squared (1 rounding op)
-   - Degree-4 Horner in xx:
-     `poly = P1 + xx*(P2 + xx*(P3 + xx*(P4 + xx*P5)))` (4 rounding ops via
-     `fp_mul_i_round`)
-   - `c = r - fp_mul_i_round(poly, xx)` — correction term (1 rounding op)
-   - `rc = fp_mul_i_round(r, c)` — (1 rounding op)
-   - `sum = SCALE_I + r + fp_div_i(rc, 2*SCALE_I - c)` — rational combination
-     (1 division)
-1. **Reconstruction** (`transcendental.rs:136-140`): `sum << k` for k >= 0,
-   `sum >> |k|` for k < 0. Uses `checked_shl` with `Err(Overflow)` on overflow.
+1. The correctly-rounded direct branch returns `SCALE+x` on
+   `-1_000_000 <= x < 1_000_000`.
+2. An i64 reciprocal proposes the nearest full-ln(2) octave. The rounded raw
+   residual is converted to Q63 by a split reciprocal (`18_446_744` plus a
+   Q28 fractional limb), avoiding both division and a wide reduction multiply.
+   A Q96 correction restores the sub-raw residual of decimal `LN2_I`.
+3. The octave residual is split into 32 cells. An exact Q63 boundary correction
+   confines `r` to `[-ln(2)/64, ln(2)/64]`.
+4. A degree-5 true-Remez polynomial is evaluated by five Q63 multiply-shifts
+   with Q22 output guards.
+5. One of 32 Q62 constants reconstructs `2^(phase/32)`. Phase, octave, and all
+   remaining guard bits are combined at the single final rounding point.
 
-**Constants used** (from `constants.rs`):
+The numerical payload is six i64 coefficients plus 32 i64 reconstruction
+constants: 304 bytes. The reconstruction constants are exact rounded
+fractional powers of two, not sampled exponential answers.
 
-- `LN2_I = 693_147_180_560` — round(ln(2) × SCALE), error +0.055 ULP
-- `LN2_LO = -54_690_582_768` — sub-ULP residual of LN2_I
-- `EXP_REMEZ_P1 = 166_666_666_667` (≈ 1/6 × SCALE)
-- `EXP_REMEZ_P2 = -2_777_777_778` (≈ -1/360 × SCALE)
-- `EXP_REMEZ_P3 = 66_137_563`
-- `EXP_REMEZ_P4 = -1_653_390`
-- `EXP_REMEZ_P5 = 41_381`
+*Proof outline.* The executable certificate parses the exact generated
+constants and source hashes, then composes four independently checked terms.
 
-*Proof.* The error decomposes into four components.
+*(A) Range reduction.* Exact width arithmetic bounds every i64 product. The
+split reciprocal plus LN2 correction differs from the ideal Q63 residual by at
+most `70.9221` Q63 units. The low-precision octave/cell reciprocals are only
+proposals; exact residual comparisons correct either proposal by at most one.
+All 3,694 reachable ln(2)/32 decision seams were exhaustively checked at 17
+adjacent raw inputs (`62,798` checks): zero wrong cells and zero monotonic
+reversals.
 
-*(A) Range reduction error.* The split LN2 approach computes
-`r = x - k * LN2_I - round(k * LN2_LO / SCALE_I)`. The residual after correction
-is bounded by the rounding of `k * LN2_LO / SCALE_I`, which is <= 0.5 ULP.
-This is a factor of ~|k| better than the uncorrected approach (which would have
-error `|k| * 0.055` ULP). **Contribution: <= 0.5 ULP** in r.
+*(B) Approximation and integer Horner.* High-precision Remez exchange gives the
+stored degree-5 polynomial. Arb interval evaluation plus exact modeling of Q22
+coefficient quantization and each Q63 multiply-shift bounds the local polynomial
+error by `7.03916600143633e-17` on the complete reduced interval.
 
-Since `d(exp(r))/dr = exp(r)` and the sum ≈ SCALE, a 0.5 ULP error in r propagates
-as `0.5 * exp(r_real) / SCALE` ≈ 0.5 ULP (since `exp(r_real) ∈ [1/√2, √2]`).
-**Range reduction contributes <= 0.7 ULP to the sum.**
+*(C) Reconstruction and widths.* The certificate includes Q62 factor
+quantization, the phase product, and the single final rounding. Every i64/i128
+intermediate is bounded below its type maximum; the most demanding phase
+product uses less than one quarter of `i128::MAX`. Reconstruction preserves the
+relative bound while absolute raw error scales with `2^octave`.
 
-*(B) Rational formula rounding.* The formula involves 7 rounding operations:
+Composing (A)–(C) gives the stated `1.54994794363012e-16` relative bound and
+the 41,159 / `2.20965e13` financial/full-domain raw envelopes. □
 
-1. `xx = fp_mul_i_round(r, r)` — 0.5 ULP
-2. `fp_mul_i_round(xx, P5)` — 0.5 ULP (attenuated by subsequent multiplications)
-3. `fp_mul_i_round(xx, poly)` — 0.5 ULP (×3 more of these)
-4-5. Two more Horner steps — 0.5 ULP each
-6. `fp_mul_i_round(poly, xx)` for c — 0.5 ULP
-7. `fp_mul_i_round(r, c)` for rc — 0.5 ULP
+*Empirical validation.* The exact 100,000-case `[-20,20]` corpus measured
+max/P99/P95/median `33,622 / 7,881 / 192 / 0`. The regenerated 10,000-case
+adversarial corpus brackets every reduction seam and measured
+`15,727,361,334,177 / 6,704,999,717,817 / 224,176,707,138 / 0`. The former
+rational kernel on the same corpora measured maxima `449,129,270` and
+`395,478,324,222,178,273`, respectively.
 
-The Horner steps (2-5) compute `poly ≈ P1 ≈ 0.167 * SCALE` (the higher-order terms
-are negligible for |r/SCALE| < 0.35). The polynomial error is attenuated by the
-subsequent `poly * xx` multiplication: `|xx/SCALE| <= 0.347^2 = 0.120`, so Horner
-errors contribute `< 2.0 * 0.120 = 0.24 ULP` to c.
-
-The `xx` error (0.5 ULP) propagates through `c = r - poly*xx` as
-`0.5 * |poly/SCALE| = 0.5 * 0.167 = 0.083 ULP`.
-
-The `rc = r * c` and `rc / (2*SCALE - c)` steps: since `|c/SCALE| < 0.06` and
-`|rc/SCALE| < 0.02`, the division error from `fp_div_i` is negligible relative to
-the sum (which is ≈ SCALE).
-
-**Total rounding in sum: < 1.5 ULP.**
-
-*(C) Approximation error.* The Remez rational formula `1 + r + r*c/(2-c)` with
-`c = r - P(xx)*xx` approximates `exp(r)` with error bounded by the Remez exchange
-algorithm. For |r/SCALE| <= 0.347, the approximation error of the degree-9 rational
-form is < 10^-14 relative, i.e. < 0.01 ULP at SCALE. **Negligible.**
-
-*(D) Reconstruction amplification.* The bit shift `sum << k` multiplies both result
-and error by 2^k. The relative error is invariant under this scaling.
-
-**Combined bound:**
-
-|Error source                |Contribution to sum|
-|----------------------------|-------------------|
-|(A) Range reduction (split) |<= 0.7 ULP         |
-|(B) Rational formula rounding|< 1.5 ULP         |
-|(C) Approximation error     |< 0.01 ULP         |
-|**Total pre-reconstruction**|**< 2.3 ULP**      |
-
-Conservative clean bound: C = 4.
-
-**Absolute error:** <= 4 × 2^k ULP. **Relative error:** < 4√2 / SCALE ≈ 5.7 × 10^-12.
-
-For |x| <= 20*SCALE: |k| <= 28, absolute bound <= 1.1 × 10^9.
-For |x| <= 40*SCALE: |k| <= 57, absolute bound <= 5.8 × 10^17.
-The relative bound (5.7 × 10^-12) holds across the full ±40×SCALE range. □
-
-*Remark (Empirical validation).* Max observed = 473M ULP at i128 boundary (consistent
-with 4 × 2^k amplification); max 1 ULP in financial domain (|x| < 20*SCALE).
-Production suite: 100K vectors.
-
-*Remark (Domain guards).* The code returns `Ok(0)` for x <= -40*SCALE (underflow
-to zero) and `Err(Overflow)` for x >= 40*SCALE. These are documented boundary
-behaviours; the high-side overflow is reported through `Result`.
+*Scope.* This proves the parsed fixed-point source model and generated
+constants. Deployed-SBF differential measurements and downstream reference
+campaigns are separate evidence; it is not a formal proof of LLVM or the SBF
+virtual machine.
 
 -----
 
@@ -1391,8 +1476,9 @@ output = checked_mul_div_u(int_result, frac_result, SCALE)
   into a single correction before rounding. Split LN2 correction via `LN2_HP` +
   `LN2_HP_LO`. Error: <= 2 ULP at HP scale.
 
-- `exp_fixed_hp` (`hp.rs:181-216`): Remez rational HP exponential. Same structure
-  as `exp_fixed_i` (Proposition 8) but at SCALE_HP with HP-specific coefficients
+- `exp_fixed_hp` (`hp.rs:181-216`): Remez rational HP exponential. This HP-only
+  path retains the former rational structure independently of the standard-scale
+  phased minimax kernel, using SCALE_HP-specific coefficients
   (`EXP_REMEZ_HP_P1..P5`). Uses `fp_mul_hp_fast` and `fp_div_hp_safe`. Split LN2
   correction via `LN2_HP` + `LN2_HP_LO`. Error: <= 3 ULP at HP scale.
 
@@ -1534,36 +1620,37 @@ consistent with the attenuation effect dominating in practice.
 |----------------------------|----|------------------------------------------------------|-----------------------|-----------------------------------|
 |fp_mul_i (Lemma 1)          |A   |< 1 (truncation remainder)                            |1                      |returns Err on overflow            |
 |fp_sqrt Path B (Prop. 1)    |A   |< 1 (exact by 256-bit bisection)                      |1                      |x*SCALE overflows u128             |
-|fp_sqrt Path A (Prop. 1)    |A/B |< 1 (Newton convergence arg.)                         |1                      |x*SCALE fits in u128               |
+|fp_sqrt Path A (Prop. 1)    |A   |< 1 (Newton invariant + checked square + exact restart)|1                      |x*SCALE fits in u128               |
 |checked_mul_div_i (Lemma 3) |A   |0 (exact)                                             |0                      |returns Err on overflow            |
 |fp_div / fp_div_i (Lemma 2) |A   |exact floor (unsigned) / trunc (signed); remainder < 1 |1                     |b != 0, result fits                |
 |fp_mul_hp_u / _i / _fast (Prop. 2)|A|<= 0.5 (rounding)                                  |0                      |no overflow                        |
 |fp_div_hp_safe (Prop. 3)    |A   |exact trunc; remainder < 1                            |—                      |b != 0, returns Ok                 |
 |checked_mul_div_floor/ceil_i (Prop. 4)|A|0 (exact)                                       |0                      |returns Err on overflow            |
 |fp_div_floor / fp_div_ceil (Prop. 5)|A|0 (exact rounding)                                 |0-1                    |b != 0, result fits                |
-|norm_cdf_poly (Prop. 6)     |B   |<= 9 (cert 2.27 + overhead 6)                          |4                      |\|x\| <= 8*SCALE                   |
-|ln_fixed_i (Prop. 7)        |B   |<= 3 (analytical, sub-ULP correction)                  |3                      |x > 0, result fits i128            |
-|exp_fixed_i (Prop. 8)       |B   |<= 4 * 2^k; rel < 5.7e-12                             |473M (boundary), 1 (financial)|\|x\| <= 40*SCALE            |
+|norm_cdf_poly (Prop. 6)     |B   |real < 2.393619; nearest-integer <= 2 ULP; monotone      |2                      |all `i128`; saturates outside ±8S  |
+|ln_fixed_i (Prop. 7)        |B   |real < 2.925564; nearest-integer <= 3 ULP                |2                      |x > 0, result fits i128            |
+|exp_fixed_i (Prop. 8)       |B   |rel < 1.55e-16; raw <= 41,159 financial / 2.21e13 full |33,622 production / 15.73T adversarial|\|x\| <= 40*SCALE            |
 |sin_core (Prop. 9a)         |B   |< 4 (certified approx 0.10 + analyt. overhead)        |2 (sin_fixed, 100K)    |\|x\| <= pi/4 * SCALE              |
 |cos_core (Prop. 9b)         |B   |< 4 (certified approx 0.16 + analyt. overhead)        |2 (cos_fixed, 100K)    |\|x\| <= pi/4 * SCALE              |
 |norm_cdf_poly_hp (Prop. 10) |B   |<= 12 (cert 3.46 + overhead 8.5); tail <= 18           |5                      |\|x\| <= 8*SCALE_HP                |
 |pow_fixed_hp (Prop. 11)     |B   |<= 5 (output<=100*S); rel < 4.4e-14                   |1 (moderate), 21.5M (extreme)  |base∈[0.01,100]*S, exp∈[0,20]*S    |
 |norm_pdf (Prop. 12)         |B   |<= 14                                                 |2                      |\|x\| <= 8*SCALE                   |
 
-**Category key:** A = exact integer proof. A/B = exact with analytical convergence
-argument. B = analytical conservative bound (worst-case accumulation and/or Lipschitz
-certificate).
+**Category key:** M = bit-precise machine-checked property. A = exact integer
+proof. B = interval-certified and/or analytical conservative bound. The
+machine-checked integer layer composes with the Category A rows; whole functions
+still require the stated arithmetic premises and induction around each harness
+boundary.
 
 ‡ `fp_div_hp_safe` (Proposition 3) uses a widened fallback when the intermediate
 `|r| * SCALE_HP` overflows i128. The result is exact for `Ok` values; unrepresentable
 quotients return `Err(Overflow)`.
 
-† The code accepts inputs up to ±40×SCALE, returns `Ok(0)` for underflow below
-that range, and returns `Err(Overflow)` above that range. The error analysis in
-Proposition 8 covers only ±20×SCALE. The relative
-error bound (< 1.7 × 10^-11) is valid for the full ±40×SCALE range; the absolute
-bound formula (12 × 2^k) is valid but gives much larger values at |x| > 20×SCALE.
-See Proposition 8 domain discrepancy remark.
+† The code accepts inputs up to ±40×SCALE, returns `Ok(0)` at and below the
+negative guard, and returns `Err(Overflow)` at and above the positive guard.
+Proposition 8 covers the complete successful interval: relative error is below
+`1.55e-16`, with conservative raw envelopes 41,159 for `|x| < 20` and
+`2.210e13` over the full guarded domain.
 
 **Notes on the table.**
 
@@ -1690,7 +1777,7 @@ of failure.
 |`pow_fixed_hp`    |base ∈ [0.01, 100]×S, exp ∈ [0, 20]×S (Prop. 11)|**UNDERFLOWS/ERR** — returns exact special cases such as x^0 and 0^y, returns `Ok(0)` when the fixed-point result underflows, and returns `Err(Overflow)` when the result is too large. Negative base impossible (u128).                                                                                                                   |Safe             |
 |`sin_core`        |\|x\| ≤ π/4 × SCALE (Prop. 9a)         |**PANICS** (debug) / **SILENT** (release) — `debug_assert!` added; public `sin_fixed` performs octant reduction before calling.                                                                                                                                                                                                            |Mitigated (internal)|
 |`cos_core`        |\|x\| ≤ π/4 × SCALE (Prop. 9b)         |**PANICS** (debug) / **SILENT** (release) — identical to sin_core. Public `cos_fixed` performs range reduction.                                                                                                                                                                                                                            |Mitigated (internal)|
-|`norm_cdf_poly`   |\|x\| ≤ 8×SCALE (Prop. 6)              |**CLAMPS** — returns 0 for x < −8×SCALE, SCALE for x > 8×SCALE. Post-clamp on polynomial output to [0, SCALE].                                                                                                                                                                                                                             |Safe             |
+|`norm_cdf_poly`   |all `i128` (Prop. 6)                    |**CLAMPS BY DESIGN** — returns 0 for x < −8×SCALE, SCALE for x > 8×SCALE. Those tails and the post-clamp are included in the all-input error and monotonicity certificate.                                                                                                                                                                  |Safe / proved    |
 |`norm_cdf_poly_hp`|\|x\| ≤ 8×SCALE_HP (Prop. 10)          |**CLAMPS** — returns 0 for x < −8×SCALE_HP, SCALE_HP for x > 8×SCALE_HP. Post-clamp on polynomial output to [0, SCALE_HP].                                                                                                                                                                                                                 |Safe             |
 |`norm_pdf`        |\|x\| ≤ 8×SCALE (Prop. 12)             |**UNDERFLOWS** — returns 0 in extreme tails after an explicit `-x²/2 < -40×SCALE` guard or unreachable `exp_fixed_i` overflow.                                                                                                                                                                                                             |Safe             |
 |`fp_div_hp_safe`  |scaled quotient fits i128 (Prop. 3)    |**ERR** — returns `Err(DivisionByZero)` for b = 0 and `Err(Overflow)` for unrepresentable quotients; uses U256 fallback for large remainder products.                                                                                                                                                                                       |Safe             |
@@ -1719,86 +1806,34 @@ non-decreasing: `norm_cdf_poly(x + δ) >= norm_cdf_poly(x)` for all δ > 0. A
 monotonicity violation means P(S < K₁) > P(S < K₂) for K₁ < K₂ — a negative
 implied density that creates phantom arbitrage signals.
 
-### Analysis at single-ULP input resolution
+### Standard-scale all-input result
 
-At standard scale (SCALE = 10^12), adjacent integer inputs x and x+1 represent
-real values differing by 10^-12. The true CDF increment between them is:
+At `SCALE = 10^12`, the true CDF increment between adjacent raw inputs is less
+than one output unit, so empirical sweeps cannot establish monotonicity. In fact,
+the exact checker found two one-unit reversals in earlier versions that 110,000
+reference vectors and a dense sweep missed.
 
-```
-Φ((x+1)/S) × S - Φ(x/S) × S ≈ φ(x/S)
-```
+The final Q23-body/Q39-tail implementation has a stronger result. For every
+piece, Arb interval subdivision proves the exact quantized polynomial derivative
+has the required strict sign. The Q44 input map is monotone; whenever it changes,
+it advances by at least 70 Q44 units. The exact adjacent polynomial increment in
+evaluation-guard units is then compared with the complete two-endpoint Horner
+rounding uncertainty. Every piece has positive margin:
 
-where φ is the standard normal PDF. This increment is at most φ(0) ≈ 0.399 — less
-than 0.4 output ULP even at the peak of the PDF. The output is therefore a staircase
-function that stays flat across many consecutive integer inputs and occasionally
-increments by 1.
+- narrowest body margin: `12.395604... > 7` in the 4.5–5 piece;
+- narrowest tail margin: `8.368553... > 3` in the 6.5–7 piece.
 
-With the proved error bound of ±43 ULP (Proposition 6), adjacent inputs could in
-theory produce outputs differing by up to 86 ULP in the "wrong" direction — if the
-error function swung from +43 to -43 across a single input step. However, the
-Lipschitz analysis constrains the rate of change of the error function. For the
-worst piece (I3, [3.0, 5.0]):
+Therefore each rounded piece is nondecreasing at single-raw-input resolution.
+Exact checks cover the center, every cross-piece seam, the 7-sigma constant-tail
+transition, the half-raw tail cutoff, and saturation. Symmetry proves the
+negative half. This establishes
 
-```
-L ≈ 2700 per real unit (derived from L × h/2 = 0.027, h = 2 × 10^-5)
-Error change per integer ULP = L / SCALE ≈ 2.7 × 10^-9
-```
-
-The error function changes by less than 3 × 10^-9 per integer input step —
-effectively constant. **Adjacent-input monotonicity violations are theoretically
-possible but constrained to at most 1 ULP in magnitude** (from the staircase
-rounding, not from error swings). These are inherent to any fixed-point CDF
-implementation and are not specific to this library.
-
-### Minimum separation for guaranteed monotonicity
-
-The meaningful question is: at what input separation δ is monotonicity guaranteed?
-This requires the true CDF increment to exceed twice the maximum possible error
-swing over that interval:
-
-```
-φ(x/S) × δ > 2 × L × δ / S + 2 × (staircase rounding)
+```text
+norm_cdf_poly(x + 1) >= norm_cdf_poly(x)
 ```
 
-Since the Lipschitz error change over interval δ is `L × δ / S`, and L/S ≈ 2.7 × 10^-9,
-this is negligible compared to φ(x/S) for all |x| ≤ 5×SCALE (where φ ≥ 1.49 × 10^-6).
-The binding constraint is the staircase rounding: the output must increment by at least
-2 to guarantee that rounding cannot reverse the ordering.
-
-**Output increments by region:**
-
-|Input region (σ)|\|x\|/SCALE|φ(x/S)|Output increment per input ULP|Steps for +2 output increment|
-|----------------|-----------|------|------------------------------|-----------------------------|
-|Near 0          |0          |0.399 |0.399                         |~5                           |
-|1σ              |1          |0.242 |0.242                         |~9                           |
-|2σ              |2          |0.054 |0.054                         |~37                          |
-|3σ              |3          |0.0044|0.0044                        |~454                         |
-|4σ              |4          |0.0001|0.0001                        |~17,000                      |
-|5σ              |5          |1.5e-6|1.5e-6                        |~1,340,000                   |
-
-At 3σ, monotonicity is guaranteed over input separations of ~454 ULP (= 4.54 × 10^-10
-in real terms). At 5σ, the minimum separation grows to ~1.34 × 10^6 ULP
-(= 1.34 × 10^-6 in real terms).
-
-### Practical implications
-
-For option pricing, the relevant granularity is the strike price increment, not
-single-ULP fixed-point steps. A typical strike increment of $0.01 on a $100 underlying
-corresponds to a standardised price ratio change of ~10^-4, which is ~10^8 input ULP
-at SCALE. This vastly exceeds the monotonicity threshold at any σ level in the table
-above.
-
-**Conclusion:** Single-ULP monotonicity violations are inherent to fixed-point CDF
-computation and cannot be eliminated at this precision without increasing SCALE.
-However, monotonicity at any practically relevant pricing granularity is guaranteed
-by the Lipschitz smoothness of the error function combined with the dominance of the
-true CDF increment over the error variation at separations above ~10^3 ULP.
-
-**Recommendation:** If strict monotonicity at single-ULP resolution is required for
-a specific application (e.g., an AMM invariant), implement a simple post-hoc
-monotonicity wrapper: `max(result, prev_result)` when evaluating the CDF at
-increasing x values. This adds no error (it only clips spurious decreases of ≤ 1 ULP)
-and guarantees monotone output for any sorted input sequence.
+for every `x < i128::MAX`, including the far clamps. No caller-side wrapper or
+minimum input separation is required for the standard-scale implementation.
 
 ### HP scale
 
@@ -1812,10 +1847,12 @@ relevant input separation, the true CDF increment dominates the error variation.
 
 ## Appendix: Compute unit budget (Solana)
 
-CU measurements from Solana localnet production benchmark runs. Most medians come
-from 50,000 on-chain vectors per function (`BENCH_CONCURRENCY=32`); avg/max values
-come from the current benchmark tables where available. All values are Solana
-compute units.
+Current changed-path figures come from the final deployed SBF consumer:
+2,000 stratified inputs per numerical path (`BENCH_CONCURRENCY=32`) plus
+explicit branch grids. All values bracket the SolMath call only. The complete
+affected-path matrix is in
+`.superstack/exp-composite-cu-revalidation-2026-07-12.md`; unaffected branch-grid
+and certificate rows remain in `.superstack/accuracy-cu-revalidation-2026-07-11.md`.
 
 ### Individual function CU cost
 
@@ -1824,60 +1861,82 @@ compute units.
 |fp_div           |625    |655      |690    |Current NUC arithmetic rerun               |
 |fp_div_i         |652    |676      |724    |Current NUC arithmetic rerun               |
 |checked_mul_div_i|883    |883      |3,807  |U256 path when product overflows u128      |
-|fp_sqrt          |3,598  |3,007    |9,402  |Thin path vs overflow path                 |
+|fp_sqrt          |3,796  |3,801    |9,027  |Thin path vs overflow path                 |
 |fp_mul_hp_i      |103    |103      |103    |Current optimized HP multiply              |
-|ln_fixed_i       |4,562  |4,362    |5,207  |Table-assisted Remez                       |
-|ln_fixed_hp      |19,175 |18,889   |19,764 |Compensated HP path                        |
-|sin_fixed        |4,654  |4,029    |5,170  |Includes range reduction                   |
-|cos_fixed        |4,578  |4,027    |5,181  |Includes range reduction                   |
-|norm_cdf_poly    |6,844  |6,186    |15,333 |Varies by piece and tail path              |
+|ln_fixed_i       |705    |739      |808    |1,024-segment Q42 cubic midpoint kernel    |
+|ln_fixed_hp      |20,090 |20,101   |21,040 |Compensated HP path                        |
+|sin_fixed        |5,072  |5,127    |6,204  |Includes range reduction                   |
+|cos_fixed        |5,044  |5,115    |5,895  |Includes range reduction                   |
+|norm_cdf_poly    |960    |983      |993    |Q23 body/Q39 tail; no exp/division          |
+|exp_fixed_i      |961    |962      |992    |N32/Q63 degree-5 phased minimax             |
+|norm_pdf         |2,262  |2,323    |2,337  |One optimized exp plus fixed multiply       |
+|pow_fixed        |2,535  |2,543    |2,727  |ln -> mul -> optimized exp                  |
 |norm_cdf_poly_hp |24,234 |19,708   |40,691 |High variance: short-circuit vs polynomial |
-|pow_fixed_hp     |27,408 |27,408   |35,000 |ln -> mul -> exp chain                     |
+|pow_fixed_hp     |28,914 |29,137   |30,041 |ln -> mul -> exp chain                     |
 
 ### Composite workflow CU cost
 
 |Workflow / function       |Avg CU |Median CU|Max CU |
 |--------------------------|-------|---------|-------|
-|**bs_full (standard)**    |50,191 |50,015   |68,418 |
-|**bs_full_hp (HP)**       |118,202|116,628  |164,961|
-|barrier_option            |262,906|261,773  |385,456|
-|pow_product_hp            |16,000 |—        |20,000 |
-|nig_64                    |344,273|346,648  |386,010|
-|implied_vol               |156,563|148,575  |395,940|
-|bvn_cdf                   |128,614|129,700  |153,090|
-|Phi2Table.eval            |943    |943      |943    |
+|**bs_full (standard)**    |24,717 |25,021   |25,650 |
+|**bs_full_hp (HP)**       |113,177|112,816  |149,925|
+|barrier_option            |270,156|270,835  |415,531|
+|pow_product_hp            |37,114 |37,151   |38,541 |
+|NIG certified pricing     |129,872|28,261   |381,385|
+|implied_vol               |88,707 |82,917   |328,660|
+|Heston deterministic      |118,523|117,092  |183,239|
+|SABR guarded price        |283,712|282,052  |603,172|
+|bvn_cdf                   |100,498|110,822  |135,944|
+|bvn_cdf_hp                |248,294|276,569  |307,310|
+|Phi2Table.eval            |1,439  |1,439    |1,440  |
 
 ### Budget assessment
 
-**Standard Black-Scholes (bs_full):** 68K CU worst case — fits comfortably within
+**Standard Black-Scholes (bs_full):** 26K CU worst case — fits comfortably within
 the default 200K CU transaction budget. Leaves ample room for surrounding program
 logic (account deserialization, state updates, CPI calls).
 
-**HP Black-Scholes (bs_full_hp):** 165K CU worst case in the benchmark set — fits
-within 200K CU but with limited headroom (~35K CU remaining). For transactions that require additional
+**HP Black-Scholes (bs_full_hp):** 150K CU worst case in the benchmark set — fits
+within 200K CU but with limited headroom (~50K CU remaining). For transactions that require additional
 computation beyond pricing (e.g., settlement logic, multi-leg evaluation), a CU
 budget increase to 400K should be requested. This is standard practice on Solana and
 has minimal gas cost impact.
 
-**NIG model (nig_64):** 386K CU worst case — requires a CU budget increase and
-may need architectural consideration (e.g., splitting across instructions) if
-combined with other computation.
+**NIG model:** the bounded exponential-NIG engine uses a Chernoff tail tier and
+an embedded 15/7 direct-OTM density integral. The final 2K deployed campaign
+measured 367,321 P99 / 381,385 max math CU and 382,441 max full-instruction CU.
+The committed 100K/10K accuracy campaign found no returned-allowance or
+requested-error violations. The allowance is empirically cross-validated, not
+a formal all-domain Gauss-Kronrod remainder proof.
 
-**Implied volatility (implied_vol):** 396K CU worst case — requires a CU budget
-increase. Iterative solvers are inherently variable; fast convergence is much
-cheaper while edge cases can approach the upper bound.
+**Implied volatility (implied_vol):** 329K CU observed maximum — request at
+least 500K plus integration headroom. Iterative solvers are variable.
 
-**Barrier options:** 385K CU worst case — require a CU budget increase.
+**Barrier options:** 416K CU observed maximum — request at least 500K plus
+integration headroom.
+
+**Deterministic Heston:** 184K CU observed maximum — request at least 250K.
+Stochastic positive-expiry Heston fails closed before quadrature.
+
+**Guarded SABR:** 604K CU observed accepted-case maximum — request at least
+700K, and do not execute without a complete surface certificate.
 
 -----
 
-## Appendix: Empirical validation summary
+## Appendix: Final empirical validation summary
 
 Production benchmark suite results (100K stratified vectors per function) superseding
 the per-result empirical remarks above. Where adversarial
 vectors were run (10K targeting known weak spots), those results are also included.
 
-### Proved bounds vs observed maxima
+The figures below were rerun on the final audit tree. Post-exp changed-path
+percentiles and downstream reference results are in
+`.superstack/exp-downstream-revalidation-2026-07-12.md`; retained unaffected
+results, model rejection counts, independent-reference methodology, and the
+broader SBF matrix are in
+`.superstack/accuracy-cu-revalidation-2026-07-11.md`.
+
+### Derived bounds vs observed maxima
 
 |Function         |Proved bound (this document)     |Observed max (production)|Observed max (adversarial)|Ratio (prod)|Status             |
 |-----------------|---------------------------------|-------------------------|--------------------------|------------|-------------------|
@@ -1888,63 +1947,65 @@ vectors were run (10K targeting known weak spots), those results are also includ
 |fp_sqrt          |≤ 1 (Prop. 1)                    |1                        |—                         |—           |✓ Consistent       |
 |fp_mul_hp_i      |≤ 0.5 (Prop. 2)                  |0                        |—                         |—           |✓ Consistent       |
 |fp_div_hp_safe   |≤ 1 (Prop. 3)                    |1                        |—                         |—           |✓ Consistent       |
-|ln_fixed_i       |≤ 15 (Prop. 7)                   |7                        |6                         |2.1×        |✓ Conservative     |
-|ln_fixed_hp      |≤ 15 (Prop. 7 analysis)          |8                        |—                         |1.9×        |✓ Conservative     |
-|exp_fixed_i      |≤ 12 × 2^k (Prop. 8)            |1.5 × 10^9 (production)  |6.0 × 10^17 (adversarial) |—           |✓ See note 1       |
-|pow_fixed_hp     |≤ 5 for output ≤ 14×S (Prop. 11) |112 × 10^6               |118.5 × 10^6              |—           |✓ See note 2       |
-|norm_cdf_poly    |≤ 43 (Prop. 6)                   |42                       |9 (deep tails)            |1.02×       |✓ Tight            |
+|ln_fixed_i       |<= 3 integer ULP (Prop. 7)       |2                        |2                         |1.5x        |Conservative       |
+|ln_fixed_hp      |≤ 15 (Prop. 7 analysis)          |2                        |2                         |7.5×        |✓ Conservative     |
+|exp_fixed_i      |rel < 1.55e-16 (Prop. 8)        |33,622                   |15,727,361,334,177       |—           |✓ See note 1       |
+|pow_fixed_hp     |≤ 5 for output ≤ 14×S (Prop. 11) |21.5 × 10^6              |41.9 × 10^6               |—           |✓ See note 2       |
+|norm_cdf_poly    |<= 2 integer ULP (Prop. 6)       |2                        |2                         |1x          |Tight              |
 |norm_cdf_poly_hp |≤ 8 / ≤ 17 (Prop. 10)            |5                        |—                         |1.6× / 3.4× |✓ Conservative     |
-|sin_fixed (full) |< 4 (Prop. 9a, core bound)       |2                        |—                         |2×          |✓ Conservative     |
-|cos_fixed (full) |< 4 (Prop. 9b, core bound)       |2                        |—                         |2×          |✓ Conservative     |
-|norm_pdf         |≤ 14 (Prop. 12)                  |2                        |—                         |7×          |✓ Very conservative|
+|sin_fixed (full) |< 4 (Prop. 9a, core bound)       |2                        |2                         |2×          |✓ Conservative     |
+|cos_fixed (full) |< 4 (Prop. 9b, core bound)       |2                        |2                         |2×          |✓ Conservative     |
+|norm_pdf         |≤ 14 (Prop. 12)                  |2                        |2                         |7×          |✓ Very conservative|
 
-**Note 1 (exp_fixed_i):** The large absolute errors are expected and consistent with
-the 2^k amplification structure (Proposition 8). At the adversarial range [25, 39.5]×SCALE
-(within the code's ±40×SCALE guard but beyond the ±20×SCALE analysis domain), the observed
-maximum of 6.0 × 10^17 is below the theoretical bound of 12 × 2^57 ≈ 1.7 × 10^18.
-The significant-figures metric is more informative: median 12.0 SF (production),
-confirming the relative error bound of ~1.7 × 10^-11 holds across the domain.
+**Note 1 (exp_fixed_i):** Absolute raw error still grows with power-of-two
+reconstruction, so the adversarial maximum occurs in the positive tail. The
+seam-complete maximum `1.573e13` is below the certified `2.210e13` full-domain
+envelope. Median error is zero on both retained corpora, and the relative
+source-model bound is below `1.55e-16`.
 
-**Note 2 (pow_fixed_hp):** The observed maximum of 112M vastly exceeds the proved
+**Note 2 (pow_fixed_hp):** The observed maximum of 21.5M exceeds the derived
 absolute bound of ≤ 5 for moderate outputs (Proposition 11). This is not a
 contradiction: the ≤ 5 bound applies only when the output is ≤ 14×SCALE. Large
 outputs amplify absolute error via the 2^k reconstruction in exp. The significant-
 figures metric (median 14.3, worst 10.9) confirms the relative error bound of
 < 3.2 × 10^-13 holds. For the adversarial suite (near-1 cancellation + overflow),
-worst-case 10.9 SF is still excellent. The standard-scale `pow_fixed` (62.7G max,
+worst-case relative precision remains the meaningful metric. The standard-scale `pow_fixed` (35.5G max,
 10.0 worst SF) is significantly less precise — **HP should be the default path for
 any precision-sensitive computation.**
 
 ### Black-Scholes end-to-end accuracy
 
-**HP path (bs_full_hp):** Max error 4 ULP on call/put price at HP scale (10^15).
+**HP path (bs_full_hp):** Max error 3/4 raw units on call/put output at SCALE (10^12).
 Cross-validated against QuantLib at 14.2 median significant figures for call/put
 prices — this exceeds the precision of IEEE 754 double-precision arithmetic (15.9
 decimal digits, but typically ~14-15 SF after a chain of transcendental evaluations).
 
 |Greek     |Max abs error (HP)|Median SF vs QuantLib|
 |----------|------------------|---------------------|
-|Call price|4                 |14.2                 |
+|Call price|3                 |14.2                 |
 |Put price |4                 |14.2                 |
 |Delta     |1                 |12.2                 |
 |Gamma     |1                 |10.1                 |
-|Vega      |9                 |14.3                 |
-|Theta     |3                 |13.8                 |
-|Rho       |22–23             |14.0–14.5            |
+|Vega      |5                 |14.3                 |
+|Theta     |1                 |13.8                 |
+|Rho       |11 / 10           |14.0–14.5            |
 
-The Rho error (22–23 HP ULP) is the largest among the Greeks. This is expected:
+The Rho error (11/10 raw units) is the largest among the HP Greeks. This is expected:
 Rho involves a multiplication by time-to-expiry T, which amplifies errors from the
 CDF and exp chain. At 14.0 SF it remains well within practical requirements.
 
-**Standard path (bs_full):** Max error 37K ULP at standard scale (10^12). This is
-orders of magnitude worse than HP, driven primarily by the standard-scale exp/pow
-chain. Median SF of 11.1–11.2 for call/put is adequate for many applications but
-leaves less headroom. The adversarial suite shows 6K max for calls, 5K for puts.
+**Standard path (bs_full):** Max call/put errors were 2,509/2,543 raw units at
+standard scale (10^12). This is orders of magnitude worse than HP because the
+standard-scale composition retains less precision across its CDF, discounting,
+and arithmetic steps. Median SF of 11.1–11.2 for call/put is adequate for many
+applications but leaves less headroom. The adversarial suite maxed at 891/1,042
+raw units for calls/puts.
 
-**Recommendation:** Use `bs_full_hp` for all pricing paths where accuracy matters.
-The CU cost premium (118K vs 50K average) is justified by the 3+ orders of magnitude
-improvement in accuracy. Reserve `bs_full` for gas-constrained paths where
-approximate pricing is acceptable (e.g., indicative quotes, UI display values).
+**Recommendation:** Use `bs_full_hp` where its extra precision is required and
+the CU budget permits it. It averages 113,177 CU versus 24,717 CU for `bs_full`,
+about a 4.6x premium. Use `bs_full` when its measured ~11 significant figures are
+adequate and CU is the tighter constraint (for example, indicative quotes or UI
+display values).
 
 ### Distribution of errors
 
@@ -1953,14 +2014,14 @@ bounds are rarely approached:
 
 |Function        |P50|P95|P99|Max|
 |----------------|---|---|---|---|
-|ln_fixed_i      |1  |3  |4  |7  |
-|norm_cdf_poly   |3  |12 |18 |42 |
+|ln_fixed_i      |0  |1  |1  |2  |
+|norm_cdf_poly   |0  |1  |2  |2  |
 |norm_cdf_poly_hp|0  |2  |2  |5  |
-|bs_full_hp.call |0  |1  |1  |4  |
+|bs_full_hp.call |0  |1  |1  |3  |
 |bs_full_hp.delta|0  |0  |0  |1  |
 |bs_full_hp.gamma|0  |0  |0  |1  |
 
-For the HP Black-Scholes path, 73.2% of call prices are computed exactly (0 error)
+For the HP Black-Scholes path, 74.5% of call prices are computed exactly (0 error)
 and 99% are within 1 ULP. This is consistent with the proved bounds being
 conservative worst-case accumulations that rarely coincide in practice.
 
@@ -2003,7 +2064,8 @@ Cross-validated against Python arbitrary-precision arithmetic across 76,070 vect
 
 ## Appendix: Benchmark formal bounds sync
 
-The benchmark suite's `CLAIMED_BOUND_STD` for `norm_cdf_poly` has been updated from
-53 to 43 (matching the Lipschitz-certified value in Proposition 6). The `ln_fixed_i`
-bound in this document is ≤ 15 (conservative ceiling of 14.5); the benchmark uses 14.
-Both are valid ceilings — the difference is a rounding convention.
+The former 43-ULP CDF and 15-ULP logarithm bounds applied to superseded
+implementations. They must not be attached to the current Q44 CDF or Q42
+midpoint logarithm. The current source-bound certificates prove at most 2
+integer ULP for `norm_cdf_poly` and at most 3 integer ULP for `ln_fixed_i`;
+their retained production and adversarial corpora both observe maxima of 2.

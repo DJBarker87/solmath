@@ -1,0 +1,129 @@
+{
+  "schema": 1,
+  "model": "exponential NIG with martingale correction and beta+1 Esscher shift",
+  "runtime": "SolMath fixed-point direct OTM Gauss-Kronrod 15/7",
+  "reference": "SciPy norminvgauss CDF Esscher identity; upper tails by NIG reflection",
+  "versions": {
+    "python": "3.12.0",
+    "numpy": "2.4.2",
+    "scipy": "1.17.0"
+  },
+  "scale": 1000000000000,
+  "seed": 86076636995622,
+  "production": {
+    "name": "production",
+    "seeded_input_sha256": "61cb4bd21a99928fde3fd0355d33ef48678bb45e4de342b7e1b534c70fdb097c",
+    "quotes": 100000,
+    "accepted": 87715,
+    "acceptance_rate": 0.87715,
+    "rejected": 12285,
+    "reference_failures": 0,
+    "reference_fallbacks": 0,
+    "reject_reasons": {
+      "ERR:NoConvergence": 12285
+    },
+    "tiers": {
+      "1": 31930,
+      "15": 55785
+    },
+    "certificate_violations": 0,
+    "request_violations": 0,
+    "absolute_error": {
+      "median": 2.028841498188837e-09,
+      "p90": 1.0762443544198934e-06,
+      "p99": 3.6945983244720546e-05,
+      "p999": 0.0001742850570218451,
+      "max": 0.0021548693882778025
+    },
+    "absolute_error_per_100_notional": {
+      "median": 4.021595665651977e-09,
+      "p90": 1.6352131242004103e-06,
+      "p99": 1.7308069350477835e-05,
+      "p999": 4.08408994775416e-05,
+      "max": 0.0005652776645896646
+    },
+    "error_over_returned_allowance": {
+      "p99": 0.010272889300898749,
+      "max": 0.5718392025867882
+    },
+    "worst_accepted_quote": {
+      "index": 23145,
+      "input": {
+        "spot": 656239072868277,
+        "strike": 2748672559598486,
+        "rate": 157701107916,
+        "dividend": -241722846734,
+        "time": 4682096661123,
+        "alpha": 96024659535280,
+        "beta": 61169458419724,
+        "delta": 2411550747456,
+        "requested": 137433627980
+      },
+      "runtime_call": 808.35060600567,
+      "runtime_put": 86.828370210432,
+      "reference_call": 808.3527608750583,
+      "reference_put": 86.8305250784249,
+      "returned_max_abs_error": 0.020350891321,
+      "max_call_put_abs_error": 0.0021548693882778025,
+      "tier": 15
+    }
+  },
+  "adversarial": {
+    "name": "adversarial",
+    "seeded_input_sha256": "8853de248219801b23eca772f3613caf011d1f8b0408ddd877645bb0c35e9340",
+    "quotes": 10000,
+    "accepted": 6898,
+    "acceptance_rate": 0.6898,
+    "rejected": 3102,
+    "reference_failures": 0,
+    "reference_fallbacks": 0,
+    "reject_reasons": {
+      "ERR:NoConvergence": 3102
+    },
+    "tiers": {
+      "1": 2539,
+      "15": 4359
+    },
+    "certificate_violations": 0,
+    "request_violations": 0,
+    "absolute_error": {
+      "median": 9.38094989594285e-10,
+      "p90": 4.297227797422926e-06,
+      "p99": 0.0006958166536893379,
+      "p999": 0.013403356502481015,
+      "max": 0.5708145623193559
+    },
+    "absolute_error_per_100_notional": {
+      "median": 5.307431714912183e-09,
+      "p90": 1.6350595724560344e-06,
+      "p99": 0.00017026511177001385,
+      "p999": 0.0011384939968817015,
+      "max": 0.00139654993281919
+    },
+    "error_over_returned_allowance": {
+      "p99": 0.017329896572244013,
+      "max": 0.2374114404934143
+    },
+    "worst_accepted_quote": {
+      "index": 1112,
+      "input": {
+        "spot": 8646523765152555,
+        "strike": 63889622966698520,
+        "rate": 200000000000,
+        "dividend": -200000000000,
+        "time": 4999999000000,
+        "alpha": 3000000000000,
+        "beta": 949999974331,
+        "delta": 1622937091,
+        "requested": 6388962296670
+      },
+      "runtime_call": 263.596781490237,
+      "runtime_put": 263.596546429515,
+      "reference_call": 264.16759602867023,
+      "reference_put": 264.16736099183436,
+      "returned_max_abs_error": 3.199794483487,
+      "max_call_put_abs_error": 0.5708145623193559,
+      "tier": 15
+    }
+  }
+}

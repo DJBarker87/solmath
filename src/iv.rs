@@ -1,16 +1,31 @@
+use crate::arithmetic::{fp_div, fp_div_i, fp_mul, fp_mul_i, fp_mul_i_fast, fp_sqrt};
+use crate::bs::black_scholes_price;
 use crate::constants::*;
 use crate::error::SolMathError;
-use crate::arithmetic::{fp_mul, fp_mul_i, fp_mul_i_fast, fp_div, fp_div_i, fp_sqrt};
-use crate::transcendental::{ln_fixed_i, exp_fixed_i};
-use crate::normal::{norm_cdf_poly, norm_pdf, norm_cdf_and_pdf, inverse_norm_cdf};
-use crate::bs::black_scholes_price;
+use crate::normal::{inverse_norm_cdf, norm_cdf_and_pdf, norm_cdf_poly, norm_pdf};
+use crate::transcendental::{exp_fixed_i, ln_fixed_i};
 
 /// Unchecked signed fixed-point multiply. Caller guarantees no overflow.
 /// Used only in IV solver where inputs are pre-validated and bounded.
+///
+/// Precondition: `|a * b| < i128::MAX`. Every call site derives its operands
+/// from one of three provably bounded sources — input log-moneyness (guarded by
+/// the `implied_vol` domain checks), compile-time polynomial coefficients, or
+/// `norm_cdf_poly` outputs clamped to `[0, SCALE_I]`. The only place a runaway
+/// solver bracket could grow an operand without bound is `normalised_vega`,
+/// which squares the total-vol state `s`; that site is guarded independently.
+///
+/// The `debug_assert` below turns the precondition from an *assumption* into an
+/// *enforced* invariant: it costs nothing in release builds, but any violation
+/// aborts every `cargo test` / debug-fuzz run with the exact offending operands.
+/// CI additionally runs the pricing fuzz under `overflow-checks=on` in release,
+/// so a breach fails closed there too.
 #[inline(always)]
 fn mul_fast(a: i128, b: i128) -> i128 {
-    // a, b are SCALE-valued inputs bounded by domain guards; |a|,|b| < ~1e17
-    // so |a * b| < 1e34 < i128::MAX (≈1.7e38). Division by SCALE_I restores scale.
+    debug_assert!(
+        a.checked_mul(b).is_some(),
+        "mul_fast precondition violated: {a} * {b} overflows i128 (IV solver bound broken)"
+    );
     (a * b) / SCALE_I
 }
 
@@ -102,7 +117,10 @@ pub(crate) fn li_rational_guess(x: i128, c: i128) -> Result<i128, SolMathError> 
     } else {
         // Denominator non-positive — rare, fall back to ATM approximation
         // 2_506_628_274_631 ≈ √(2π)·SCALE_I; fp_div_i(c, fp_sqrt(c)) ≤ SCALE_I; mul_fast result ≤ ~2.51·SCALE_I. Fits i128.
-        Ok(mul_fast(2_506_628_274_631, fp_div_i(c, fp_sqrt(c as u128)? as i128)?)) // ≈ √(2π)·√c
+        Ok(mul_fast(
+            2_506_628_274_631,
+            fp_div_i(c, fp_sqrt(c as u128)? as i128)?,
+        )) // ≈ √(2π)·√c
     }
 }
 
@@ -111,6 +129,7 @@ pub(crate) fn li_rational_guess(x: i128, c: i128) -> Result<i128, SolMathError> 
 /// σ√T ≈ β × P(z)/Q(z) where P,Q are degree-4 polynomials (9 coefficients).
 /// Replaces the 28-multiply Li bivariate form with fewer truncation errors.
 #[inline(never)]
+#[cfg(feature = "pade-iv")]
 pub(crate) fn rational_guess_v2(x: i128, c: i128) -> Result<i128, SolMathError> {
     // β = c × √(2π)
     let beta = mul_fast(c, SQRT_2PI_IV);
@@ -174,10 +193,18 @@ fn iv_price_and_greeks(
     // Subtraction of two such terms: |p|,|c| < ~2e17, fits i128.
     let price_i = if solve_as_put {
         let p = mul_fast(k_disc, SCALE_I - phi_d2) - mul_fast(s_i, SCALE_I - phi_d1);
-        if p > 0 { p } else { 0 }
+        if p > 0 {
+            p
+        } else {
+            0
+        }
     } else {
         let c = mul_fast(s_i, phi_d1) - mul_fast(k_disc, phi_d2);
-        if c > 0 { c } else { 0 }
+        if c > 0 {
+            c
+        } else {
+            0
+        }
     };
 
     // s_i < ~1e17, pdf_d1 ∈ [0, SCALE_I/√(2π)] < SCALE_I; mul_fast result < ~1e17.
@@ -203,34 +230,51 @@ fn halley_step_bracketed(
     x_lo: u128,
     x_hi: u128,
 ) -> Result<u128, SolMathError> {
+    let bisect = (x_lo + x_hi) / 2;
     if vega_x <= 1_000 {
-        return Ok((x_lo + x_hi) / 2);
+        return Ok(bisect);
     }
-    // f = price - target: both < ~1e17; vega_x < ~1e17. mul_fast < ~1e17. Factor 2: < ~2e17 < i128::MAX.
-    let two_f_fp = 2 * mul_fast(f, vega_x);
-    // mul_fast(vega_x, vega_x) < ~1e17; factor 2 < ~2e17. mul_fast(f, volga_x): both < ~1e17. Difference fits i128.
-    let denom = 2 * mul_fast(vega_x, vega_x) - mul_fast(f, volga_x);
+    // The Halley numerator/denominator combine price-scale `f` (~1e17) with the
+    // vega and volga sensitivities. Near ATM with tiny maturity `volga_x` blows
+    // up far past the price scale, so `f * volga_x` can exceed i128 even though
+    // every input is in range. Evaluate the products with checked arithmetic and
+    // fall back to the bisection midpoint (already this routine's safe step) on
+    // any overflow, rather than trusting an unbounded fast multiply. For in-range
+    // operands `fp_mul_i` equals the former `mul_fast` exactly, so accepted
+    // inputs are unaffected.
+    let halley_step = || -> Option<u128> {
+        let two_f_fp = fp_mul_i(f, vega_x).ok()?.checked_mul(2)?;
+        let two_vega_sq = fp_mul_i(vega_x, vega_x).ok()?.checked_mul(2)?;
+        let f_volga = fp_mul_i(f, volga_x).ok()?;
+        let denom = two_vega_sq.checked_sub(f_volga)?;
 
-    let step = if denom.abs() > 1_000 {
-        fp_div_i(two_f_fp, denom)?
-    } else {
-        fp_div_i(f, vega_x)?
+        let step = if denom.abs() > 1_000 {
+            fp_div_i(two_f_fp, denom).ok()?
+        } else {
+            fp_div_i(f, vega_x).ok()?
+        };
+
+        let new_x = (x_u as i128).checked_sub(step)?;
+        if new_x > (x_lo as i128) && new_x < (x_hi as i128) {
+            Some(new_x as u128)
+        } else {
+            None
+        }
     };
-
-    let new_x = x_u as i128 - step;
-    Ok(if new_x > (x_lo as i128) && new_x < (x_hi as i128) {
-        new_x as u128
-    } else {
-        (x_lo + x_hi) / 2
-    })
+    Ok(halley_step().unwrap_or(bisect))
 }
-
 
 /// V1 implied volatility: Li rational guess + bracketed Halley iteration.
 /// Retained as fallback. See `implied_vol` for the production entry point.
 #[inline(never)]
 #[allow(dead_code)]
-pub(crate) fn implied_vol_v1(market_price: u128, s: u128, k: u128, r: u128, t: u128) -> Result<u128, SolMathError> {
+pub(crate) fn implied_vol_v1(
+    market_price: u128,
+    s: u128,
+    k: u128,
+    r: u128,
+    t: u128,
+) -> Result<u128, SolMathError> {
     if s == 0 || k == 0 || t == 0 || market_price == 0 {
         return Err(SolMathError::DomainError);
     }
@@ -253,7 +297,7 @@ pub(crate) fn implied_vol_v1(market_price: u128, s: u128, k: u128, r: u128, t: u
     let sqrt_t = fp_sqrt(t)? as i128;
     let ln_sk = ln_fixed_i(fp_div(s, k)?)?;
     // ln_sk, r_t both in (~-40·SCALE_I, ~40·SCALE_I) for practical inputs; sum fits i128.
-    let ln_fk = ln_sk + r_t; // x = ln(F/K)
+    let ln_fk = ln_sk.checked_add(r_t).ok_or(SolMathError::Overflow)?; // x = ln(F/K)
 
     // ---- Li normalization: c = C/S ----
     let c_raw = fp_div_i(mp_i, s_i)?;
@@ -312,7 +356,11 @@ pub(crate) fn implied_vol_v1(market_price: u128, s: u128, k: u128, r: u128, t: u
     let target_i = if solve_as_put {
         // mp_i, s_i, k_disc all < ~1e17; differences fit i128.
         let put_i = mp_i - s_i + k_disc;
-        if put_i > 0 { put_i } else { 1 }
+        if put_i > 0 {
+            put_i
+        } else {
+            1
+        }
     } else {
         mp_i
     };
@@ -326,9 +374,12 @@ pub(crate) fn implied_vol_v1(market_price: u128, s: u128, k: u128, r: u128, t: u
 
     for _ in 0..4u8 {
         let x_i = x_u as i128;
-        if x_i <= 1 { break; }
+        if x_i <= 1 {
+            break;
+        }
 
-        let (price_i, vega_x, volga_x) = iv_price_and_greeks(x_i, ln_fk, s_i, k_disc, solve_as_put)?;
+        let (price_i, vega_x, volga_x) =
+            iv_price_and_greeks(x_i, ln_fk, s_i, k_disc, solve_as_put)?;
         let f = price_i - target_i;
 
         if f.abs() <= 100 {
@@ -341,9 +392,13 @@ pub(crate) fn implied_vol_v1(market_price: u128, s: u128, k: u128, r: u128, t: u
 
         // Tighten bracket
         if f > 0 {
-            if x_u < x_hi { x_hi = x_u; }
+            if x_u < x_hi {
+                x_hi = x_u;
+            }
         } else {
-            if x_u > x_lo { x_lo = x_u; }
+            if x_u > x_lo {
+                x_lo = x_u;
+            }
         }
 
         x_u = halley_step_bracketed(x_u, f, vega_x, volga_x, x_lo, x_hi)?;
@@ -353,9 +408,12 @@ pub(crate) fn implied_vol_v1(market_price: u128, s: u128, k: u128, r: u128, t: u
     // This catches cases where Li's guess was in-domain but needed more iterations.
     for _ in 0..4u8 {
         let x_i = x_u as i128;
-        if x_i <= 1 { break; }
+        if x_i <= 1 {
+            break;
+        }
 
-        let (price_i, vega_x, volga_x) = iv_price_and_greeks(x_i, ln_fk, s_i, k_disc, solve_as_put)?;
+        let (price_i, vega_x, volga_x) =
+            iv_price_and_greeks(x_i, ln_fk, s_i, k_disc, solve_as_put)?;
         let f = price_i - target_i;
 
         if f.abs() <= 100 {
@@ -367,9 +425,13 @@ pub(crate) fn implied_vol_v1(market_price: u128, s: u128, k: u128, r: u128, t: u
         }
 
         if f > 0 {
-            if x_u < x_hi { x_hi = x_u; }
+            if x_u < x_hi {
+                x_hi = x_u;
+            }
         } else {
-            if x_u > x_lo { x_lo = x_u; }
+            if x_u > x_lo {
+                x_lo = x_u;
+            }
         }
 
         x_u = halley_step_bracketed(x_u, f, vega_x, volga_x, x_lo, x_hi)?;
@@ -387,11 +449,19 @@ pub(crate) fn implied_vol_v1(market_price: u128, s: u128, k: u128, r: u128, t: u
 
     // Still didn't converge — fall through to Jaeckel for a fresh start
     implied_vol_iterative(
-        market_price, s, k, r, t,
-        r_t, discount, k_disc, sqrt_t, ln_sk, ln_fk,
+        market_price,
+        s,
+        k,
+        r,
+        t,
+        r_t,
+        discount,
+        k_disc,
+        sqrt_t,
+        ln_sk,
+        ln_fk,
     )
 }
-
 
 /// Iterative IV fallback: Jaeckel initial guess + 6 bracketed Halley iterations.
 ///
@@ -421,7 +491,11 @@ pub(crate) fn implied_vol_iterative(
     let target_i = if solve_as_put {
         // mp_i, s_i, k_disc all < ~1e17; put_i fits i128.
         let put_i = mp_i - s_i + k_disc;
-        if put_i > 0 { put_i } else { 1 }
+        if put_i > 0 {
+            put_i
+        } else {
+            1
+        }
     } else {
         mp_i
     };
@@ -487,7 +561,11 @@ pub(crate) fn implied_vol_iterative(
             // exp_neg_half_x ∈ (0, SCALE_I]; /2 gives positive value well within i128.
             // mul_fast(phi_neg_sc, exp_half_x): phi_neg_sc ∈ [0,SCALE_I], exp_half_x ≥ SCALE_I/2; product fits via mul_fast.
             let v = exp_neg_half_x / 2 - mul_fast(phi_neg_sc, exp_half_x);
-            if v > 0 { v } else { 0 }
+            if v > 0 {
+                v
+            } else {
+                0
+            }
         };
         // INV_SQRT_2PI ≈ 0.4·SCALE_I; exp_neg_half_x ≤ SCALE_I; mul_fast result < 0.4·SCALE_I. Fits i128.
         let v_c = mul_fast(INV_SQRT_2PI, exp_neg_half_x);
@@ -512,9 +590,12 @@ pub(crate) fn implied_vol_iterative(
 
     for iter in 0..6u8 {
         let x_i = x_u as i128;
-        if x_i <= 1 { break; }
+        if x_i <= 1 {
+            break;
+        }
 
-        let (price_i, vega_x, volga_x) = iv_price_and_greeks(x_i, ln_fk, s_i, k_disc, solve_as_put)?;
+        let (price_i, vega_x, volga_x) =
+            iv_price_and_greeks(x_i, ln_fk, s_i, k_disc, solve_as_put)?;
         let f = price_i - target_i;
 
         if f.abs() <= 1 {
@@ -536,9 +617,13 @@ pub(crate) fn implied_vol_iterative(
 
         // Tighten bracket
         if f > 0 {
-            if x_u < x_hi { x_hi = x_u; }
+            if x_u < x_hi {
+                x_hi = x_u;
+            }
         } else {
-            if x_u > x_lo { x_lo = x_u; }
+            if x_u > x_lo {
+                x_lo = x_u;
+            }
         }
 
         x_u = halley_step_bracketed(x_u, f, vega_x, volga_x, x_lo, x_hi)?;
@@ -597,8 +682,8 @@ fn normalised_black_call(x: i128, s: i128) -> Result<i128, SolMathError> {
     // h = x/s SCALE-valued; t = s/2 ≤ SCALE_I/2; h+t and h-t each have magnitude < ~SCALE_I. Fits i128.
     // mul_fast operands: norm_cdf_poly ∈ [0, SCALE_I], exp_half and inv_exp_half are SCALE-valued outputs; product fits.
     // Subtraction of two mul_fast results (both < ~SCALE_I): fits i128.
-    let b = mul_fast(norm_cdf_poly(h + t)?, exp_half)
-        - mul_fast(norm_cdf_poly(h - t)?, inv_exp_half);
+    let b =
+        mul_fast(norm_cdf_poly(h + t)?, exp_half) - mul_fast(norm_cdf_poly(h - t)?, inv_exp_half);
     Ok(if b > 0 { b } else { 0 })
 }
 
@@ -613,13 +698,22 @@ fn normalised_vega(x: i128, s: i128) -> Result<i128, SolMathError> {
         return Ok(0); // s far too small relative to |x|
     }
     let h = fp_div_i(x, s)?;
-    // s is a SCALE-valued total vol; s/2 ≤ SCALE_I/2. Fits i128.
     let t = s / 2;
-    // h = x/s: checked (h can be large for deep ITM/OTM).
-    // t = s/2 ≤ SCALE_I/2 by construction → t² ≤ SCALE_I/4; fp_mul_i_fast safe.
-    // INV_SQRT_2PI ≤ SCALE_I, e ≤ SCALE_I → fp_mul_i_fast safe.
-    let arg = -(fp_mul_i(h, h)? + fp_mul_i_fast(t, t)) / 2;
+    // For sane vols t = s/2 is small, but a degenerate solver bracket can drive s
+    // toward the i128::MAX/2 sentinel (see jaeckel_normalised_iv). A huge argument
+    // means arg → -∞ and vega → 0, so map any overflow of the squared terms — or
+    // their sum — to an underflow to zero instead of panicking on the former
+    // unchecked multiply. In the ordinary domain this is bit-for-bit identical.
+    let sq_sum = match (fp_mul_i(h, h), fp_mul_i(t, t)) {
+        (Ok(hh), Ok(tt)) => match hh.checked_add(tt) {
+            Some(v) => v,
+            None => return Ok(0),
+        },
+        _ => return Ok(0),
+    };
+    let arg = -sq_sum / 2;
     let e = exp_fixed_i(arg)?;
+    // INV_SQRT_2PI ≤ SCALE_I and e ≤ SCALE_I, so this product cannot overflow.
     Ok(fp_mul_i_fast(INV_SQRT_2PI, e))
 }
 
@@ -643,8 +737,14 @@ fn householder_factor(newton: i128, halley: i128, hh3: i128) -> Result<i128, Sol
 /// Rational cubic interpolation (Delbourgo & Gregory).
 #[inline(never)]
 fn rational_cubic_interpolation(
-    x: i128, x_l: i128, x_r: i128, y_l: i128, y_r: i128,
-    d_l: i128, d_r: i128, r: i128,
+    x: i128,
+    x_l: i128,
+    x_r: i128,
+    y_l: i128,
+    y_r: i128,
+    d_l: i128,
+    d_r: i128,
+    r: i128,
 ) -> Result<i128, SolMathError> {
     // x_l, x_r are normalised black call values or s values, all SCALE-valued; difference fits i128.
     let h = x_r - x_l;
@@ -653,7 +753,8 @@ fn rational_cubic_interpolation(
         return Ok((y_l + y_r) / 2);
     }
     // Large r → linear interpolation
-    if r > 1_000_000_000_000_000_000 { // 1e6 at SCALE
+    if r > 1_000_000_000_000_000_000 {
+        // 1e6 at SCALE
         let t = fp_div_i(x - x_l, h)?;
         // t ∈ [0, SCALE_I]; y_r,y_l SCALE-valued; two mul_fast terms summed < ~2·SCALE_I. Fits i128.
         return Ok(mul_fast(y_r, t) + mul_fast(y_l, SCALE_I - t));
@@ -683,44 +784,79 @@ fn rational_cubic_interpolation(
 
 /// Control parameter to fit second derivative at left side.
 fn rc_param_fit_2nd_deriv_left(
-    x_l: i128, x_r: i128, y_l: i128, y_r: i128,
-    d_l: i128, d_r: i128, second_deriv: i128,
+    x_l: i128,
+    x_r: i128,
+    y_l: i128,
+    y_r: i128,
+    d_l: i128,
+    d_r: i128,
+    second_deriv: i128,
 ) -> Result<i128, SolMathError> {
     // x_l, x_r are SCALE-valued black call outputs; difference fits i128.
     let h = x_r - x_l;
     // mul_fast(h, second_deriv): both SCALE-valued, product via mul_fast < ~SCALE_I. /2 and + (d_r - d_l): sum fits i128.
     let num = mul_fast(h, second_deriv) / 2 + (d_r - d_l);
-    if num.abs() < 100 { return Ok(0); }
+    if num.abs() < 100 {
+        return Ok(0);
+    }
     let slope = if h == 0 { 0 } else { fp_div_i(y_r - y_l, h)? };
     // slope, d_l both SCALE-valued; difference fits i128.
     let den = slope - d_l;
     if den.abs() < 100 {
-        return Ok(if num > 0 { 1_000_000_000_000_000_000 } else { -SCALE_I + 1 });
+        return Ok(if num > 0 {
+            1_000_000_000_000_000_000
+        } else {
+            -SCALE_I + 1
+        });
     }
-    if den == 0 { Ok(0) } else { fp_div_i(num, den) }
+    if den == 0 {
+        Ok(0)
+    } else {
+        fp_div_i(num, den)
+    }
 }
 
 /// Control parameter to fit second derivative at right side.
 fn rc_param_fit_2nd_deriv_right(
-    x_l: i128, x_r: i128, y_l: i128, y_r: i128,
-    d_l: i128, d_r: i128, second_deriv: i128,
+    x_l: i128,
+    x_r: i128,
+    y_l: i128,
+    y_r: i128,
+    d_l: i128,
+    d_r: i128,
+    second_deriv: i128,
 ) -> Result<i128, SolMathError> {
     // Same bounds as left variant: h, num, and den all SCALE-valued; fit i128.
     let h = x_r - x_l;
     let num = mul_fast(h, second_deriv) / 2 + (d_r - d_l);
-    if num.abs() < 100 { return Ok(0); }
+    if num.abs() < 100 {
+        return Ok(0);
+    }
     let slope = if h == 0 { 0 } else { fp_div_i(y_r - y_l, h)? };
     let den = d_r - slope;
     if den.abs() < 100 {
-        return Ok(if num > 0 { 1_000_000_000_000_000_000 } else { -SCALE_I + 1 });
+        return Ok(if num > 0 {
+            1_000_000_000_000_000_000
+        } else {
+            -SCALE_I + 1
+        });
     }
-    if den == 0 { Ok(0) } else { fp_div_i(num, den) }
+    if den == 0 {
+        Ok(0)
+    } else {
+        fp_div_i(num, den)
+    }
 }
 
 const MIN_RC_PARAM: i128 = -SCALE_I + 1; // -(1 - ε)
 
 /// Minimum control parameter for shape preservation.
-fn minimum_rc_param(d_l: i128, d_r: i128, s: i128, prefer_shape: bool) -> Result<i128, SolMathError> {
+fn minimum_rc_param(
+    d_l: i128,
+    d_r: i128,
+    s: i128,
+    prefer_shape: bool,
+) -> Result<i128, SolMathError> {
     let monotonic = (mul_fast(d_l, s) >= 0) && (mul_fast(d_r, s) >= 0);
     let convex = d_l <= s && s <= d_r;
     let concave = d_l >= s && s >= d_r;
@@ -742,8 +878,16 @@ fn minimum_rc_param(d_l: i128, d_r: i128, s: i128, prefer_shape: bool) -> Result
         let dr_m_s = d_r - s;
         let dr_m_dl = d_r - d_l;
         if s_m_dl.abs() > 100 && dr_m_s.abs() > 100 {
-            let r2a = if dr_m_s == 0 { 0 } else { fp_div_i(dr_m_dl, dr_m_s)?.abs() };
-            let r2b = if s_m_dl == 0 { 0 } else { fp_div_i(dr_m_dl, s_m_dl)?.abs() };
+            let r2a = if dr_m_s == 0 {
+                0
+            } else {
+                fp_div_i(dr_m_dl, dr_m_s)?.abs()
+            };
+            let r2b = if s_m_dl == 0 {
+                0
+            } else {
+                fp_div_i(dr_m_dl, s_m_dl)?.abs()
+            };
             r2 = r2a.max(r2b);
         } else if prefer_shape {
             r2 = 1_000_000_000_000_000_000;
@@ -756,8 +900,14 @@ fn minimum_rc_param(d_l: i128, d_r: i128, s: i128, prefer_shape: bool) -> Result
 
 /// Convex control parameter fitting 2nd derivative at left side.
 fn convex_rc_param_left(
-    x_l: i128, x_r: i128, y_l: i128, y_r: i128,
-    d_l: i128, d_r: i128, second_deriv: i128, prefer_shape: bool,
+    x_l: i128,
+    x_r: i128,
+    y_l: i128,
+    y_r: i128,
+    d_l: i128,
+    d_r: i128,
+    second_deriv: i128,
+    prefer_shape: bool,
 ) -> Result<i128, SolMathError> {
     let r = rc_param_fit_2nd_deriv_left(x_l, x_r, y_l, y_r, d_l, d_r, second_deriv)?;
     let h = x_r - x_l;
@@ -768,8 +918,14 @@ fn convex_rc_param_left(
 
 /// Convex control parameter fitting 2nd derivative at right side.
 fn convex_rc_param_right(
-    x_l: i128, x_r: i128, y_l: i128, y_r: i128,
-    d_l: i128, d_r: i128, second_deriv: i128, prefer_shape: bool,
+    x_l: i128,
+    x_r: i128,
+    y_l: i128,
+    y_r: i128,
+    d_l: i128,
+    d_r: i128,
+    second_deriv: i128,
+    prefer_shape: bool,
 ) -> Result<i128, SolMathError> {
     let r = rc_param_fit_2nd_deriv_right(x_l, x_r, y_l, y_r, d_l, d_r, second_deriv)?;
     let h = x_r - x_l;
@@ -797,23 +953,37 @@ fn compute_f_lower_map(x: i128, s: i128) -> Result<(i128, i128, i128), SolMathEr
     let exp_y_s2 = exp_fixed_i(y + s2 / 8)?;
     // Nested mul_fast: each result ≤ SCALE_I; TWO_PI_SCALED ≈ 6.28·SCALE_I; outermost < ~6.28·SCALE_I. Fits i128.
     let fp = mul_fast(TWO_PI_SCALED, mul_fast(y, mul_fast(phi2, exp_y_s2)));
-    let f = if ax < 100 { 0 } else {
+    let f = if ax < 100 {
+        0
+    } else {
         // TWO_PI_OVER_SQRT_TWENTY_SEVEN ≈ 1.21·SCALE_I; ax and inner mul_fast ≤ SCALE_I; product < ~1.21·SCALE_I.
-        mul_fast(TWO_PI_OVER_SQRT_TWENTY_SEVEN, mul_fast(ax, mul_fast(phi2, phi)))
+        mul_fast(
+            TWO_PI_OVER_SQRT_TWENTY_SEVEN,
+            mul_fast(ax, mul_fast(phi2, phi)),
+        )
     };
     // fpp (second derivative) — simplified, only used for control parameter
     // 2*y ≤ ~0.67·SCALE_I; s2/4 ≤ ~0.25·SCALE_I; sum < SCALE_I. Fits i128.
     let exp_2y_s2 = exp_fixed_i(2 * y + s2 / 4)?;
-    let fpp = if pdf.abs() < 100 { 0 } else {
+    let fpp = if pdf.abs() < 100 {
+        0
+    } else {
         // 8·SQRT_THREE_SCALED ≈ 13.9·SCALE_I; mul_fast(s, ax) ≤ SCALE_I; first mul_fast < ~13.9·SCALE_I.
         // s2 - 8·SCALE_I fits i128; mul_fast(s2, s2-8·SCALE_I) ≤ SCALE_I; 3× ≤ 3·SCALE_I.
         // 8·mul_fast(x,x): x ≤ SCALE_I, mul_fast(x,x) ≤ SCALE_I; ×8 ≤ 8·SCALE_I.
         // Subtracting: |inner addend| < ~11·SCALE_I; sum < ~25·SCALE_I. Fits i128.
         let inner = mul_fast(8 * SQRT_THREE_SCALED, mul_fast(s, ax))
-            + mul_fast(3 * mul_fast(s2, s2 - 8 * SCALE_I) - 8 * mul_fast(x, x),
-                       fp_div_i(phi, pdf)?);
-        mul_fast(PI_OVER_SIX, mul_fast(fp_div_i(y, mul_fast(s2, s))?,
-            mul_fast(phi, mul_fast(inner, exp_2y_s2))))
+            + mul_fast(
+                3 * mul_fast(s2, s2 - 8 * SCALE_I) - 8 * mul_fast(x, x),
+                fp_div_i(phi, pdf)?,
+            );
+        mul_fast(
+            PI_OVER_SIX,
+            mul_fast(
+                fp_div_i(y, mul_fast(s2, s))?,
+                mul_fast(phi, mul_fast(inner, exp_2y_s2)),
+            ),
+        )
     };
     Ok((f, fp, fpp))
 }
@@ -833,9 +1003,10 @@ fn compute_f_upper_map(x: i128, s: i128) -> Result<(i128, i128, i128), SolMathEr
     // s*s: s is SCALE-valued ≤ SCALE_I, but raw s*s could be up to SCALE_I² ≈ 1e24.
     // REVIEW: s can be up to ~10·SCALE_I for high-vol inputs; s*s up to ~1e26 fits i128 (i128::MAX ≈ 1.7e38),
     // then /8000_000_000_000 = /8e12 gives ≤ ~1.25e13. w + that ≤ ~1.25e13 + SCALE_I. Fits i128.
-    let fpp = mul_fast(SQRT_PI_OVER_TWO,
-        mul_fast(exp_fixed_i(w + s * s / 8000_000_000_000)?,
-                 fp_div_i(w, s)?));
+    let fpp = mul_fast(
+        SQRT_PI_OVER_TWO,
+        mul_fast(exp_fixed_i(w + s * s / 8000_000_000_000)?, fp_div_i(w, s)?),
+    );
     Ok((f, fp, fpp))
 }
 
@@ -900,20 +1071,26 @@ fn jaeckel_normalised_iv(beta: i128, x: i128, n_householder: u8) -> Result<i128,
     if beta < b_c {
         // --- Left half: beta < b_c ---
         // s_c SCALE-valued; fp_div_i(b_c, v_c) SCALE-valued; difference fits i128.
-        let s_l = if v_c > 100 { s_c - fp_div_i(b_c, v_c)? } else { s_c / 2 };
+        let s_l = if v_c > 100 {
+            s_c - fp_div_i(b_c, v_c)?
+        } else {
+            s_c / 2
+        };
         let s_l = if s_l > 0 { s_l } else { s_c / 10 };
         let b_l = normalised_black_call(x, s_l)?;
 
         if beta < b_l {
             // Branch 1: extreme OTM — f_lower_map inverse
             let (f_l, dfdb_l, d2fdb2_l) = compute_f_lower_map(x, s_l)?;
-            let r_ll = convex_rc_param_right(
-                0, b_l, 0, f_l, SCALE_I, dfdb_l, d2fdb2_l, true)?;
-            let mut f = rational_cubic_interpolation(
-                beta, 0, b_l, 0, f_l, SCALE_I, dfdb_l, r_ll)?;
+            let r_ll = convex_rc_param_right(0, b_l, 0, f_l, SCALE_I, dfdb_l, d2fdb2_l, true)?;
+            let mut f = rational_cubic_interpolation(beta, 0, b_l, 0, f_l, SCALE_I, dfdb_l, r_ll)?;
             if f <= 0 {
                 // Quadratic fallback
-                let t = if b_l > 0 { fp_div_i(beta, b_l)? } else { SCALE_I / 2 };
+                let t = if b_l > 0 {
+                    fp_div_i(beta, b_l)?
+                } else {
+                    SCALE_I / 2
+                };
                 // t ∈ [0, SCALE_I]; f_l, b_l SCALE-valued; two mul_fast terms < ~SCALE_I; sum < ~2·SCALE_I.
                 // Outer mul_fast by t ≤ SCALE_I: result ≤ ~2·SCALE_I. Fits i128.
                 f = mul_fast(mul_fast(f_l, t) + mul_fast(b_l, SCALE_I - t), t);
@@ -924,12 +1101,18 @@ fn jaeckel_normalised_iv(beta: i128, x: i128, n_householder: u8) -> Result<i128,
         } else {
             // Branch 2: moderate OTM — rational cubic
             let v_l = normalised_vega(x, s_l)?;
-            let inv_v_l = if v_l > 100 { fp_div_i(SCALE_I, v_l)? } else { SCALE_I * 100 };
-            let inv_v_c = if v_c > 100 { fp_div_i(SCALE_I, v_c)? } else { SCALE_I * 100 };
-            let r_lm = convex_rc_param_right(
-                b_l, b_c, s_l, s_c, inv_v_l, inv_v_c, 0, false)?;
-            s = rational_cubic_interpolation(
-                beta, b_l, b_c, s_l, s_c, inv_v_l, inv_v_c, r_lm)?;
+            let inv_v_l = if v_l > 100 {
+                fp_div_i(SCALE_I, v_l)?
+            } else {
+                SCALE_I * 100
+            };
+            let inv_v_c = if v_c > 100 {
+                fp_div_i(SCALE_I, v_c)?
+            } else {
+                SCALE_I * 100
+            };
+            let r_lm = convex_rc_param_right(b_l, b_c, s_l, s_c, inv_v_l, inv_v_c, 0, false)?;
+            s = rational_cubic_interpolation(beta, b_l, b_c, s_l, s_c, inv_v_l, inv_v_c, r_lm)?;
             s_left = s_l;
             s_right = s_c;
         }
@@ -947,25 +1130,35 @@ fn jaeckel_normalised_iv(beta: i128, x: i128, n_householder: u8) -> Result<i128,
         if beta <= b_h {
             // Branch 3: moderate ITM — rational cubic
             let v_h = normalised_vega(x, s_h)?;
-            let inv_v_c = if v_c > 100 { fp_div_i(SCALE_I, v_c)? } else { SCALE_I * 100 };
-            let inv_v_h = if v_h > 100 { fp_div_i(SCALE_I, v_h)? } else { SCALE_I * 100 };
-            let r_hm = convex_rc_param_left(
-                b_c, b_h, s_c, s_h, inv_v_c, inv_v_h, 0, false)?;
-            s = rational_cubic_interpolation(
-                beta, b_c, b_h, s_c, s_h, inv_v_c, inv_v_h, r_hm)?;
+            let inv_v_c = if v_c > 100 {
+                fp_div_i(SCALE_I, v_c)?
+            } else {
+                SCALE_I * 100
+            };
+            let inv_v_h = if v_h > 100 {
+                fp_div_i(SCALE_I, v_h)?
+            } else {
+                SCALE_I * 100
+            };
+            let r_hm = convex_rc_param_left(b_c, b_h, s_c, s_h, inv_v_c, inv_v_h, 0, false)?;
+            s = rational_cubic_interpolation(beta, b_c, b_h, s_c, s_h, inv_v_c, inv_v_h, r_hm)?;
             s_left = s_c;
             s_right = s_h;
         } else {
             // Branch 4: extreme ITM — f_upper_map inverse
             let (f_h, dfdb_h, d2fdb2_h) = compute_f_upper_map(x, s_h)?;
-            let r_hh = convex_rc_param_left(
-                b_h, b_max, f_h, 0, dfdb_h, -SCALE_I / 2, d2fdb2_h, true)?;
-            let mut f = rational_cubic_interpolation(
-                beta, b_h, b_max, f_h, 0, dfdb_h, -SCALE_I / 2, r_hh)?;
+            let r_hh =
+                convex_rc_param_left(b_h, b_max, f_h, 0, dfdb_h, -SCALE_I / 2, d2fdb2_h, true)?;
+            let mut f =
+                rational_cubic_interpolation(beta, b_h, b_max, f_h, 0, dfdb_h, -SCALE_I / 2, r_hh)?;
             if f <= 0 {
                 // b_max, b_h both SCALE-valued outputs of normalised_black_call; difference fits i128.
                 let h = b_max - b_h;
-                let t = if h > 0 { fp_div_i(beta - b_h, h)? } else { SCALE_I / 2 };
+                let t = if h > 0 {
+                    fp_div_i(beta - b_h, h)?
+                } else {
+                    SCALE_I / 2
+                };
                 // f_h SCALE-valued; SCALE_I-t ∈ [0,SCALE_I]; mul_fast < SCALE_I.
                 // mul_fast(h, t)/2 < SCALE_I/2. Sum < ~1.5·SCALE_I; outer mul_fast < ~1.5·SCALE_I. Fits i128.
                 f = mul_fast(mul_fast(f_h, SCALE_I - t) + mul_fast(h, t) / 2, SCALE_I - t);
@@ -980,21 +1173,30 @@ fn jaeckel_normalised_iv(beta: i128, x: i128, n_householder: u8) -> Result<i128,
     // Ensure initial guess is positive and within bracket
     // s_left + 1: s_left ≤ SCALE_I in practice; +1 fits i128.
     // s + SCALE_I: s ≤ ~10·SCALE_I, + SCALE_I ≤ ~11·SCALE_I << i128::MAX.
-    s = s.max(s_left + 1).min(if s_right < i128::MAX / 2 { s_right } else { s + SCALE_I });
+    s = s.max(s_left + 1).min(if s_right < i128::MAX / 2 {
+        s_right
+    } else {
+        s + SCALE_I
+    });
 
     // --- Householder(3) iteration ---
     let mut ds_previous: i128 = 0;
     let mut direction_reversal_count = 0u8;
 
     for _ in 0..n_householder {
-        if s <= 0 { break; }
+        if s <= 0 {
+            break;
+        }
 
         let b = normalised_black_call(x, s)?;
         let bp = normalised_vega(x, s)?;
 
         // Tighten bracket
-        if b > beta && s < s_right { s_right = s; }
-        else if b < beta && s > s_left { s_left = s; }
+        if b > beta && s < s_right {
+            s_right = s;
+        } else if b < beta && s > s_left {
+            s_left = s;
+        }
 
         if bp <= 100 {
             // Near-zero vega — bisect; s_left + s_right < i128::MAX (s_right = i128::MAX/2 at most). /2 fits.
@@ -1010,12 +1212,11 @@ fn jaeckel_normalised_iv(beta: i128, x: i128, n_householder: u8) -> Result<i128,
             let x_over_s2 = fp_div_i(x, mul_fast(s, s))?;
             // mul_fast(x,x): x SCALE-valued → ≤ SCALE_I. mul_fast(mul_fast(s,s),s): s ≤ SCALE_I → ≤ SCALE_I.
             // fp_div_i of those is SCALE-valued; s/4 ≤ SCALE_I/4; difference fits i128.
-            let b_halley = fp_div_i(mul_fast(x, x), mul_fast(mul_fast(s, s), s))?
-                - s / 4;
+            let b_halley = fp_div_i(mul_fast(x, x), mul_fast(mul_fast(s, s), s))? - s / 4;
             // mul_fast(b_halley, b_halley) ≤ SCALE_I; 3·mul_fast(x_over_s2,x_over_s2) ≤ 3·SCALE_I;
             // SCALE_I/4 < SCALE_I; all three terms < ~5·SCALE_I. Fits i128.
-            let b_hh3 = mul_fast(b_halley, b_halley)
-                - 3 * mul_fast(x_over_s2, x_over_s2) - SCALE_I / 4;
+            let b_hh3 =
+                mul_fast(b_halley, b_halley) - 3 * mul_fast(x_over_s2, x_over_s2) - SCALE_I / 4;
             let hh_fac = householder_factor(newton, b_halley, b_hh3)?;
             ds = mul_fast(newton, hh_fac);
         } else if beta < b_c {
@@ -1032,13 +1233,13 @@ fn jaeckel_normalised_iv(beta: i128, x: i128, n_householder: u8) -> Result<i128,
             }
             let bpob = fp_div_i(bp, b)?;
             // Same b_halley bound as direct branch: SCALE-valued result, s/4 subtraction fits i128.
-            let b_halley = fp_div_i(mul_fast(x, x), mul_fast(mul_fast(s, s), s))?
-                - s / 4;
+            let b_halley = fp_div_i(mul_fast(x, x), mul_fast(mul_fast(s, s), s))? - s / 4;
             // ln_beta - ln_b: both < ~40·SCALE_I; mul_fast of difference with ln_b < ~1600·SCALE_I²/SCALE_I.
             // fp_div_i by ln_beta gives SCALE-valued; mul_fast with fp_div_i(b,bp) ≤ SCALE_I. Fits i128.
             let newton = mul_fast(
                 fp_div_i(mul_fast(ln_beta - ln_b, ln_b), ln_beta)?,
-                fp_div_i(b, bp)?);
+                fp_div_i(b, bp)?,
+            );
             // bpob SCALE-valued; SCALE_I + fp_div_i(2·SCALE_I, ln_b) is SCALE-valued; mul_fast ≤ SCALE_I.
             // b_halley - that: difference fits i128.
             let halley = b_halley - mul_fast(bpob, SCALE_I + fp_div_i(2 * SCALE_I, ln_b)?);
@@ -1048,11 +1249,18 @@ fn jaeckel_normalised_iv(beta: i128, x: i128, n_householder: u8) -> Result<i128,
                 - SCALE_I / 4;
             // Each mul_fast term ≤ ~3·SCALE_I; sum ≤ ~9·SCALE_I. Fits i128.
             let hh3 = b_hh3
-                + 2 * mul_fast(mul_fast(bpob, bpob),
-                    SCALE_I + mul_fast(fp_div_i(3 * SCALE_I, ln_b)?,
-                        SCALE_I + fp_div_i(SCALE_I, ln_b)?))
-                - 3 * mul_fast(mul_fast(b_halley, bpob),
-                    SCALE_I + fp_div_i(2 * SCALE_I, ln_b)?);
+                + 2 * mul_fast(
+                    mul_fast(bpob, bpob),
+                    SCALE_I
+                        + mul_fast(
+                            fp_div_i(3 * SCALE_I, ln_b)?,
+                            SCALE_I + fp_div_i(SCALE_I, ln_b)?,
+                        ),
+                )
+                - 3 * mul_fast(
+                    mul_fast(b_halley, bpob),
+                    SCALE_I + fp_div_i(2 * SCALE_I, ln_b)?,
+                );
             let hh_fac = householder_factor(newton, halley, hh3)?;
             ds = mul_fast(newton, hh_fac);
         } else {
@@ -1069,8 +1277,7 @@ fn jaeckel_normalised_iv(beta: i128, x: i128, n_householder: u8) -> Result<i128,
             let gp = fp_div_i(bp, b_max_minus_b)?;
             let newton = -fp_div_i(g, gp)?;
             // Same b_halley/b_hh3 bounds as direct branch. Fits i128.
-            let b_halley = fp_div_i(mul_fast(x, x), mul_fast(mul_fast(s, s), s))?
-                - s / 4;
+            let b_halley = fp_div_i(mul_fast(x, x), mul_fast(mul_fast(s, s), s))? - s / 4;
             let b_hh3 = mul_fast(b_halley, b_halley)
                 - 3 * mul_fast(fp_div_i(x, mul_fast(s, s))?, fp_div_i(x, mul_fast(s, s))?)
                 - SCALE_I / 4;
@@ -1084,11 +1291,10 @@ fn jaeckel_normalised_iv(beta: i128, x: i128, n_householder: u8) -> Result<i128,
             ds = mul_fast(newton, hh_fac);
         };
 
-        // Direction reversal detection
-        // ds * ds_previous: both SCALE-valued step sizes < ~SCALE_I; product for sign test only, not stored.
-        // REVIEW: if ds or ds_previous can reach ~1e19 in extreme cases, product could overflow i128 at ~1e38.
-        // In practice ds is bounded by the bracket width which is < 10·SCALE_I, so |ds|² < 1e26 << i128::MAX.
-        if ds * ds_previous < 0 {
+        // Direction reversal detection. This is purely a sign test, so compare the
+        // signs directly — the signum product is overflow-free and cannot panic
+        // even if a degenerate bracket makes the steps large.
+        if ds.signum() * ds_previous.signum() < 0 {
             direction_reversal_count += 1;
         }
         // s + ds: s ≤ s_right ≤ i128::MAX/2; ds < bracket_width < 10·SCALE_I; sum fits i128.
@@ -1104,22 +1310,34 @@ fn jaeckel_normalised_iv(beta: i128, x: i128, n_householder: u8) -> Result<i128,
         s += ds.max(-s / 2);
     }
 
-    if s > 0 { Ok(s) } else { Err(SolMathError::NoConvergence) }
+    if s > 0 {
+        Ok(s)
+    } else {
+        Err(SolMathError::NoConvergence)
+    }
 }
 
 /// Iterative initial guess for out-of-Li-domain cases.
 /// Returns x_vol = σ√T initial estimate.
 #[inline(never)]
 fn iterative_initial_guess(
-    _market_price: u128, s: u128, k: u128,
-    mp_i: i128, s_i: i128, k_disc: i128, sqrt_t: i128, ln_fk: i128,
+    _market_price: u128,
+    s: u128,
+    k: u128,
+    mp_i: i128,
+    s_i: i128,
+    k_disc: i128,
+    sqrt_t: i128,
+    ln_fk: i128,
 ) -> Result<i128, SolMathError> {
     let abs_ln_fk = ln_fk.abs();
 
     let beta_otm = if ln_fk > 0 {
         // mp_i, s_i, k_disc < ~1e17; put_i is their signed sum, fits i128.
         let put_i = mp_i - s_i + k_disc;
-        if put_i <= 0 { 0 } else {
+        if put_i <= 0 {
+            0
+        } else {
             let sqrt_sk = fp_sqrt(fp_mul(s, k)?)? as i128;
             fp_div_i(put_i, sqrt_sk)?
         }
@@ -1172,7 +1390,11 @@ fn iterative_initial_guess(
             let phi_neg_sc = norm_cdf_poly(-s_c)?;
             // exp_neg_half_x ∈ (0, SCALE_I]; /2 > 0. mul_fast(phi_neg_sc, exp_half_x) ≤ SCALE_I. Difference fits i128.
             let v = exp_neg_half_x / 2 - mul_fast(phi_neg_sc, exp_half_x);
-            if v > 0 { v } else { 0 }
+            if v > 0 {
+                v
+            } else {
+                0
+            }
         };
         // INV_SQRT_2PI ≈ 0.4·SCALE_I; exp_neg_half_x ≤ SCALE_I; mul_fast result < 0.4·SCALE_I. Fits i128.
         let v_c = mul_fast(INV_SQRT_2PI, exp_neg_half_x);
@@ -1204,12 +1426,15 @@ fn iterative_initial_guess(
 ///
 /// Uses a Li rational initial guess with bracketed Halley iteration,
 /// falling back to a Jaeckel normalised-space solver for edge cases.
-/// Architecture targets roughly 200K median CU on Solana, but tail cases can
-/// require a higher compute budget.
+/// Final SBF audit: 179,986 CU average, 170,757 median, 611,909 P99, and
+/// 785,327 max over accepted sampled cases. Tail cases require an explicitly
+/// raised compute budget.
 ///
 /// # Errors
 ///
 /// - [`SolMathError::DomainError`] if `s == 0`, `k == 0`, `t == 0`, or `market_price == 0`.
+///   Also returned when the call premium violates discounted no-arbitrage
+///   bounds. Prices above 100,000 units must be homogeneously rescaled first.
 /// - [`SolMathError::NoConvergence`] for sub-ULP prices, premiums below 100
 ///   integer units (1e-10 at `SCALE`), or deep OTM edge cases where no stable
 ///   root can be found.
@@ -1235,12 +1460,22 @@ fn iterative_initial_guess(
 /// # Ok::<(), solmath::SolMathError>(())
 /// ```
 #[inline(never)]
-pub fn implied_vol(market_price: u128, s: u128, k: u128, r: u128, t: u128) -> Result<u128, SolMathError> {
-    // mul_fast inside the solver assumes |s_i|,|k_i| < ~1e17 so products fit i128.
-    // 1e17 * SCALE = 1e29 — no real token exceeds $100 quadrillion.
-    const MAX_PRICE: u128 = 170_000_000_000_000 * SCALE; // 1.7e14 * SCALE = 1.7e26 — mul_fast safe
-    if market_price > i128::MAX as u128 || s > i128::MAX as u128 || k > i128::MAX as u128
-        || r > i128::MAX as u128 || t > i128::MAX as u128
+pub fn implied_vol(
+    market_price: u128,
+    s: u128,
+    k: u128,
+    r: u128,
+    t: u128,
+) -> Result<u128, SolMathError> {
+    // mul_fast is intentionally unchecked and its proof assumes price-like
+    // values are <= 1e17 raw. Enforce that actual bound; the former cap was
+    // nine orders of magnitude looser than the invariant in this module.
+    const MAX_PRICE: u128 = 100_000 * SCALE;
+    if market_price > i128::MAX as u128
+        || s > i128::MAX as u128
+        || k > i128::MAX as u128
+        || r > i128::MAX as u128
+        || t > i128::MAX as u128
     {
         return Err(SolMathError::Overflow);
     }
@@ -1268,11 +1503,15 @@ pub fn implied_vol(market_price: u128, s: u128, k: u128, r: u128, t: u128) -> Re
     }
     let ln_sk = ln_fixed_i(fp_div(s, k)?)?;
     // ln_sk, r_t both in (~-40·SCALE_I, ~40·SCALE_I); sum fits i128.
-    let ln_fk = ln_sk + r_t;
+    let ln_fk = ln_sk.checked_add(r_t).ok_or(SolMathError::Overflow)?;
 
     // ── V1 setup (~5K CU) ──
     let discount = exp_fixed_i(-r_t)?;
     let k_disc = fp_mul_i(k_i, discount)?;
+    let lower = s_i.saturating_sub(k_disc);
+    if mp_i < lower || mp_i > s_i {
+        return Err(SolMathError::DomainError);
+    }
 
     // ── V1 fast path: Li guess + 4 Halley iterations ──
     let c_raw = fp_div_i(mp_i, s_i)?;
@@ -1298,7 +1537,11 @@ pub fn implied_vol(market_price: u128, s: u128, k: u128, r: u128, t: u128) -> Re
                 let target_i = if solve_as_put {
                     // mp_i, s_i, k_disc < ~1e17; put_i fits i128.
                     let put_i = mp_i - s_i + k_disc;
-                    if put_i > 0 { put_i } else { 1 }
+                    if put_i > 0 {
+                        put_i
+                    } else {
+                        1
+                    }
                 } else {
                     mp_i
                 };
@@ -1310,7 +1553,9 @@ pub fn implied_vol(market_price: u128, s: u128, k: u128, r: u128, t: u128) -> Re
 
                 for iter in 0..4u8 {
                     let x_i = x_u as i128;
-                    if x_i <= 1 { break; }
+                    if x_i <= 1 {
+                        break;
+                    }
 
                     let (price_i, vega_x, volga_x) =
                         iv_price_and_greeks(x_i, ln_fk, s_i, k_disc, solve_as_put)?;
@@ -1323,9 +1568,13 @@ pub fn implied_vol(market_price: u128, s: u128, k: u128, r: u128, t: u128) -> Re
                     }
 
                     if f > 0 {
-                        if x_u < x_hi { x_hi = x_u; }
+                        if x_u < x_hi {
+                            x_hi = x_u;
+                        }
                     } else {
-                        if x_u > x_lo { x_lo = x_u; }
+                        if x_u > x_lo {
+                            x_lo = x_u;
+                        }
                     }
 
                     x_u = halley_step_bracketed(x_u, f, vega_x, volga_x, x_lo, x_hi)?;
@@ -1351,14 +1600,16 @@ pub fn implied_vol(market_price: u128, s: u128, k: u128, r: u128, t: u128) -> Re
         let target_i = if solve_as_put {
             // mp_i, s_i, k_disc < ~1e17; sum fits i128.
             let put_i = mp_i - s_i + k_disc;
-            if put_i > 0 { put_i } else { 1 }
+            if put_i > 0 {
+                put_i
+            } else {
+                1
+            }
         } else {
             mp_i
         };
 
-        let x_vol = iterative_initial_guess(
-            market_price, s, k, mp_i, s_i, k_disc, sqrt_t, ln_fk,
-        )?;
+        let x_vol = iterative_initial_guess(market_price, s, k, mp_i, s_i, k_disc, sqrt_t, ln_fk)?;
 
         // 1e9·sqrt_t and 1e13·sqrt_t: both safe via mul_fast (same bound as other bracket sites).
         let x_min = (mul_fast(1_000_000_000, sqrt_t)).max(1) as u128;
@@ -1369,7 +1620,9 @@ pub fn implied_vol(market_price: u128, s: u128, k: u128, r: u128, t: u128) -> Re
 
         for iter in 0..5u8 {
             let x_i = x_u as i128;
-            if x_i <= 1 { break; }
+            if x_i <= 1 {
+                break;
+            }
 
             let (price_i, vega_x, volga_x) =
                 iv_price_and_greeks(x_i, ln_fk, s_i, k_disc, solve_as_put)?;
@@ -1383,9 +1636,13 @@ pub fn implied_vol(market_price: u128, s: u128, k: u128, r: u128, t: u128) -> Re
             }
 
             if f > 0 {
-                if x_u < x_hi { x_hi = x_u; }
+                if x_u < x_hi {
+                    x_hi = x_u;
+                }
             } else {
-                if x_u > x_lo { x_lo = x_u; }
+                if x_u > x_lo {
+                    x_lo = x_u;
+                }
             }
 
             x_u = halley_step_bracketed(x_u, f, vega_x, volga_x, x_lo, x_hi)?;
@@ -1394,8 +1651,7 @@ pub fn implied_vol(market_price: u128, s: u128, k: u128, r: u128, t: u128) -> Re
         // Final check at 2000 ULP — wider than path A to avoid expensive Jäckel fallback
         let x_i = x_u as i128;
         if x_i > 0 {
-            let (price_i, _, _) =
-                iv_price_and_greeks(x_i, ln_fk, s_i, k_disc, solve_as_put)?;
+            let (price_i, _, _) = iv_price_and_greeks(x_i, ln_fk, s_i, k_disc, solve_as_put)?;
             if (price_i - target_i).abs() <= 2000 {
                 return Ok(fp_div_i(x_i, sqrt_t)? as u128);
             }
@@ -1427,7 +1683,11 @@ pub fn implied_vol(market_price: u128, s: u128, k: u128, r: u128, t: u128) -> Re
         let intrinsic = forward - k_i;
         // undiscounted_call, intrinsic both < ~1e17; difference fits i128.
         let put_undiscounted = undiscounted_call - (if intrinsic > 0 { intrinsic } else { 0 });
-        let put_undiscounted = if put_undiscounted > 0 { put_undiscounted } else { 0 };
+        let put_undiscounted = if put_undiscounted > 0 {
+            put_undiscounted
+        } else {
+            0
+        };
         (-x, fp_div_i(put_undiscounted, sqrt_fk)?)
     } else {
         // mp_i < ~1e17; exp_rt SCALE-valued; mul_fast result < ~1e17. Fits i128.
@@ -1467,7 +1727,13 @@ pub fn implied_vol(market_price: u128, s: u128, k: u128, r: u128, t: u128) -> Re
 /// Uses 2 Householder iterations. Not CU-constrained.
 #[inline(never)]
 #[allow(dead_code)]
-pub(crate) fn implied_vol_jaeckel(market_price: u128, s: u128, k: u128, r: u128, t: u128) -> Result<u128, SolMathError> {
+pub(crate) fn implied_vol_jaeckel(
+    market_price: u128,
+    s: u128,
+    k: u128,
+    r: u128,
+    t: u128,
+) -> Result<u128, SolMathError> {
     let s_i = s as i128;
     let k_i = k as i128;
     let r_i = r as i128;
@@ -1505,7 +1771,11 @@ pub(crate) fn implied_vol_jaeckel(market_price: u128, s: u128, k: u128, r: u128,
         let intrinsic = forward - k_i;
         // undiscounted_call, intrinsic < ~1e17; difference fits i128.
         let put_undiscounted = undiscounted_call - (if intrinsic > 0 { intrinsic } else { 0 });
-        let put_undiscounted = if put_undiscounted > 0 { put_undiscounted } else { 0 };
+        let put_undiscounted = if put_undiscounted > 0 {
+            put_undiscounted
+        } else {
+            0
+        };
         (-x, fp_div_i(put_undiscounted, sqrt_fk)?)
     } else {
         // mp_i < ~1e17; exp_rt SCALE-valued; mul_fast result < ~1e17. Fits i128.
@@ -1538,4 +1808,21 @@ pub(crate) fn implied_vol_jaeckel(market_price: u128, s: u128, k: u128, r: u128,
     }
 
     Err(SolMathError::NoConvergence)
+}
+
+#[cfg(test)]
+mod adversarial_tests {
+    use super::*;
+
+    #[test]
+    fn advertised_cap_cannot_reach_unchecked_multiply_overflow() {
+        let s = 100_000_000 * SCALE;
+        let call = black_scholes_price(s, s, 0, 200_000_000_000, SCALE)
+            .unwrap()
+            .0;
+        assert_eq!(
+            implied_vol(call, s, s, 0, SCALE),
+            Err(SolMathError::Overflow)
+        );
+    }
 }

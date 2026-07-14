@@ -4,24 +4,200 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   msrv:
     name: msrv library check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.79.0
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: 1.79.0
       - run: cargo check --lib --all-features
 
   test:
     name: test and package
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: 1.93.0
+          targets: thumbv7em-none-eabihf
+          components: rustfmt
       - run: git diff --check
+      - run: cargo fmt --check
+      - name: Clippy correctness and suspicious-code gates
+        run: cargo clippy --lib --all-features -- -A warnings -D clippy::correctness -D clippy::suspicious -D clippy::perf -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::unreachable
       - run: cargo test --no-default-features
       - run: cargo test
       - run: cargo test --all-features
+      - run: RUSTFLAGS="-C overflow-checks=on" cargo test --release --all-features
+      - run: RUSTFLAGS="-C overflow-checks=off" cargo test --release --all-features
+      - name: No-panic fuzz soak (checked layer + pricing surface)
+        # Larger deterministic sweep of the public pricing surface with overflow
+        # checks on, so any unchecked-multiply breach fails the build hard. This
+        # is the continuously-run form of the safe-by-construction guarantee.
+        env:
+          SOLMATH_FUZZ_ITERS: "5000000"
+          RUSTFLAGS: "-C overflow-checks=on"
+        run: |
+          cargo test --release --all-features --test checked_layer -- --nocapture
+          cargo test --release --all-features --test critical_invariants -- --nocapture
+      - run: cargo check --target thumbv7em-none-eabihf --lib --all-features
+      - name: Verify the public feature contract
+        run: python3 scripts/verify_feature_contract.py
+      - name: Check every feature independently
+        run: |
+          while IFS= read -r feature; do
+            cargo check --lib --no-default-features --features "$feature"
+          done < <(python3 scripts/verify_feature_contract.py --list)
       - run: cargo check --examples --all-features
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
+      - run: ./scripts/verify_critical_invariants.sh
       - run: cargo package
+      - name: Test the exact published source tree
+        run: |
+          package_version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          cargo test --manifest-path "target/package/solmath-${package_version}/Cargo.toml" --all-features
+      - name: Verify published package surface
+        run: |
+          package_files="$(cargo package --list)"
+          for required in \
+            src/american_kbi.rs \
+            src/american_kbi_data.rs \
+            docs/AMERICAN_KBI.md \
+            USAGE.md \
+            VALIDATION.md \
+            examples/american_kbi_batch.rs \
+            docs/NIG.md; do
+            if ! grep -Fxq "$required" <<<"$package_files"; then
+              echo "required release asset missing from crate: $required" >&2
+              exit 1
+            fi
+          done
+          for excluded in \
+            benchmark/prod_ln_vectors.json \
+            benchmark/adv_ln_vectors.json \
+            benchmark/prod_ln_1p_vectors.json \
+            benchmark/adv_ln_1p_vectors.json \
+            benchmark/prod_expm1_vectors.json \
+            benchmark/adv_expm1_vectors.json \
+            benchmark/prod_exp_vectors.json \
+            benchmark/adv_exp_vectors.json \
+            benchmark/prod_norm_cdf_vectors.json \
+            benchmark/adv_norm_cdf_vectors.json \
+            benchmark/asian_quantlib_vectors.json \
+            benchmark/american_kbi_runtime_accuracy_report.json \
+            benchmark/american_kbi_unseen_accuracy_report.json \
+            benchmark/american_kbi_release_report.json \
+            benchmark/nig_independent_oracle_report.json \
+            benchmark/nig_cu_report.json \
+            benchmark/nig_footprint_report.json \
+            benchmark/nig_release_report.json \
+            benchmark/sbf-footprint/Cargo.toml \
+            benchmark/sbf-composite/Cargo.toml \
+            benchmark/sbf-composite/package.json \
+            benchmark/sbf-composite/package-lock.json \
+            PROOFS.md \
+            examples/README.md \
+            examples/anchor_options_pricing.md \
+            src/american_rom.rs \
+            src/american_rom_data.rs \
+            src/american_rom_operator_data.rs \
+            docs/AMERICAN_ROM.md \
+            examples/american_rom_batch.rs; do
+            if grep -Fxq "$excluded" <<<"$package_files"; then
+              echo "repository-only asset leaked into crate: $excluded" >&2
+              exit 1
+            fi
+          done
+          for excluded in \
+            examples/american_closed_form_batch.rs \
+            src/american.rs \
+            src/phi2_bs2002.rs \
+            benchmark/american_kbi_vs_closed_form_report.json \
+            benchmark/american_kbi_vs_closed_form_cu_report.json \
+            examples/american_volterra_batch.rs \
+            src/american_volterra.rs; do
+            if grep -Fxq "$excluded" <<<"$package_files"; then
+              echo "obsolete compatibility asset leaked into crate: $excluded" >&2
+              exit 1
+            fi
+          done
+      - name: Enforce compact crate package
+        run: |
+          package_version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          package_path="target/package/solmath-${package_version}.crate"
+          package_bytes="$(wc -c <"$package_path")"
+          package_limit=$((260 * 1024))
+          echo "package: $package_bytes bytes (limit: $package_limit)"
+          if [ "$package_bytes" -gt "$package_limit" ]; then
+            echo "published crate exceeds the 260 KiB size ceiling" >&2
+            exit 1
+          fi
+
+  numerical-certificates:
+    name: rigorous numerical certificates
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+      - name: Install hash-locked certificate dependencies
+        run: >-
+          python3 -m pip install --disable-pip-version-check
+          --only-binary=:all: --require-hashes
+          -r scripts/requirements-certificates.txt
+      - run: python3 scripts/generate_american_kbi_data.py --check src/american_kbi_data.rs
+      - run: python3 scripts/certify_ln_fixed.py
+      - run: python3 scripts/certify_exp_fixed.py
+      - run: python3 scripts/certify_norm_cdf.py
+
+  formal-verification:
+    name: bit-precise Kani proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f
+        with:
+          kani-version: "0.67.0"
+          args: "--features full"
+
+  dependency-audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: 1.93.0
+      - run: cargo install cargo-audit --locked --version 0.22.0
+      - run: cargo audit
+      - name: Audit repository-only SBF harnesses
+        run: |
+          cargo audit --file benchmark/sbf-footprint/Cargo.lock
+          cargo audit --file benchmark/sbf-composite/Cargo.lock
+      - name: Audit repository-only metering client
+        run: |
+          npm ci --prefix benchmark/sbf-composite --ignore-scripts --no-audit --no-fund
+          npm audit --prefix benchmark/sbf-composite --omit=dev --ignore-scripts

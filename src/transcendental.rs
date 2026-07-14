@@ -1,25 +1,144 @@
+use crate::arithmetic::{fp_div_i, fp_mul, fp_mul_i, fp_sqrt};
 use crate::constants::*;
 use crate::error::SolMathError;
-use crate::arithmetic::{fp_mul, fp_mul_i, fp_mul_i_round, fp_div_i, fp_sqrt};
-use crate::overflow::checked_mul_div_u;
+use crate::exp_coeffs::{
+    EXP2_PHASE_Q62, EXP_LN2_RESIDUAL_Q96, EXP_PHASES, EXP_PHASE_BITS, EXP_POLY_GUARD,
+    EXP_RAW_TO_Q63_FRAC_Q28, EXP_RAW_TO_Q63_HI, EXP_REMEZ_Q22, EXP_STEP_Q63,
+};
+use crate::expm1_lut::{
+    EXPM1_INV_LN2_Q56, EXPM1_LUT_SEGMENTS, EXPM1_LUT_STEP, EXPM1_LUT_STEP_SHIFT,
+    EXPM1_MID_EXP_RAW_Q22, EXPM1_RAW_TO_Q43_G31, EXPM1_R_MIN,
+};
 use crate::hp::pow_fixed_hp;
+use crate::ln2_lut::{K_LN2_MAX, K_LN2_MIN, K_LN2_RAW};
+use crate::ln_lut::{
+    LN_LUT_HALF_STEP, LN_LUT_MID_LOG, LN_LUT_SEGMENTS, LN_LUT_STEP, LN_Q42_RECIP_G32,
+};
+use crate::overflow::checked_mul_div_u;
+
+#[inline(always)]
+fn round_shift_signed(value: i128, shift: u32) -> i128 {
+    let half = 1i128 << (shift - 1);
+    if value >= 0 {
+        (value + half) >> shift
+    } else {
+        -((-value + half) >> shift)
+    }
+}
+
+#[inline(always)]
+fn round_shift_i64(value: i64, shift: u32) -> i64 {
+    let half = 1i64 << (shift - 1);
+    if value >= 0 {
+        (value + half) >> shift
+    } else {
+        -((-value + half) >> shift)
+    }
+}
+
+#[inline(always)]
+fn mul_q42(a: i64, b: i64) -> i64 {
+    round_shift_i64(a * b, 42)
+}
+
+#[inline(always)]
+fn mul_q43(a: i64, b: i64) -> i64 {
+    round_shift_i64(a * b, 43)
+}
+
+#[inline(always)]
+fn mul_q63_i64(a: i64, b: i64) -> i64 {
+    round_shift_signed(a as i128 * b as i128, 63) as i64
+}
+
+/// Wide-division-free local log kernel for a mantissa in `[SCALE, 2*SCALE)`.
+#[inline]
+fn ln_mantissa_lut(m: u128, k: i32) -> i128 {
+    debug_assert!(m >= SCALE && m < 2 * SCALE);
+    debug_assert!((K_LN2_MIN..=K_LN2_MAX).contains(&k));
+
+    // Preserve exact rounded logarithms for powers of two without entering
+    // the local polynomial around the first midpoint.
+    if m == SCALE {
+        return K_LN2_RAW[(k - K_LN2_MIN) as usize] as i128;
+    }
+
+    let offset = m - SCALE;
+    // `offset < 1e12` and the step is below 1e9, so this exact index needs
+    // only a 64-bit division. Keeping it as u128 links the much costlier SBF
+    // wide-division path even though neither operand requires it.
+    let j = ((offset as u64) / (LN_LUT_STEP as u64)) as usize;
+    debug_assert!(j < LN_LUT_SEGMENTS);
+    let midpoint = SCALE + j as u128 * LN_LUT_STEP + LN_LUT_HALF_STEP;
+    let d = m as i64 - midpoint as i64;
+
+    // q=(m-midpoint)/midpoint at Q42. The reciprocal carries 32 guard bits,
+    // and this conversion plus every polynomial product fits i64.
+    let q = round_shift_i64(d * LN_Q42_RECIP_G32[j], 32);
+    let q2 = mul_q42(q, q);
+    let q3 = mul_q42(q2, q);
+    let local_q42 = q - q2 / 2 + q3 / 3;
+    // One final wide conversion preserves a single rounding point. This is
+    // the only i128 multiplication in the local kernel.
+    let local_raw = round_shift_signed(local_q42 as i128 * SCALE_I, 42);
+
+    let k_log = K_LN2_RAW[(k - K_LN2_MIN) as usize];
+    LN_LUT_MID_LOG[j] as i128 + local_raw + k_log as i128
+}
+
+#[cold]
+#[inline(never)]
+fn normalize_ln_fallback(value: u128) -> (u128, i32) {
+    // SCALE has bit length 40. A bit-length estimate gets the mantissa into
+    // [2^39, 2^40) in one shift; because SCALE lies inside that interval, at
+    // most one corrected shift is needed. Re-shifting the original value is
+    // important: adjusting an already truncated mantissa would lose one bit.
+    let bit_length = 128 - value.leading_zeros() as i32;
+    let mut k = bit_length - 40;
+    let shift = |exponent: i32| {
+        if exponent >= 0 {
+            value >> exponent as u32
+        } else {
+            value << (-exponent) as u32
+        }
+    };
+    let mut m = shift(k);
+    if m < SCALE {
+        k -= 1;
+        m = shift(k);
+    } else if m >= 2 * SCALE {
+        k += 1;
+        m = shift(k);
+    }
+    (m, k)
+}
+
+#[inline]
+fn normalize_ln(value: u128) -> (u128, i32) {
+    if value >= SCALE && value < 2 * SCALE {
+        (value, 0)
+    } else if value >= SCALE / 2 && value < SCALE {
+        (value * 2, -1)
+    } else {
+        normalize_ln_fallback(value)
+    }
+}
 
 /// Natural logarithm: ln(x / SCALE) * SCALE.
 ///
-/// 16-entry split-constant lookup + degree-3 Remez polynomial on narrow subinterval.
-/// Combined sub-ULP correction (table + LN2 residuals in one rounding).
+/// Wide-division-free 1,024-segment Q42 midpoint kernel with a cubic residual.
 ///
 /// - **x**: unsigned fixed-point at `SCALE` (1e12). Must be > 0.
 /// - **Returns**: `i128` at `SCALE`. Negative for x < SCALE, zero for x == SCALE.
 /// - **Errors**: `DomainError` if `x == 0`.
-/// - **Accuracy**: max 3 ULP, median 1 ULP, 44% exact.
+/// - **Accuracy**: max 2 ULP over the retained production and adversarial corpora.
 ///
 /// # Example
 /// ```
 /// use solmath::{ln_fixed_i, SCALE};
 /// // ln(2.0) ≈ 0.693147...
 /// let result = ln_fixed_i(2 * SCALE)?;
-/// assert!((result - 693_147_180_560i128).abs() <= 3);
+/// assert!((result - 693_147_180_560i128).abs() <= 2);
 /// # Ok::<(), solmath::SolMathError>(())
 /// ```
 pub fn ln_fixed_i(x: u128) -> Result<i128, SolMathError> {
@@ -27,103 +146,78 @@ pub fn ln_fixed_i(x: u128) -> Result<i128, SolMathError> {
         return Err(SolMathError::DomainError);
     }
 
-    let mut m = x;
-    let mut k: i32 = 0;
-
-    // Primary reduction: m in [SCALE, 2*SCALE)
-    while m < SCALE {
-        m = m.checked_mul(2).ok_or(SolMathError::Overflow)?;
-        k -= 1;
-    }
-    while m >= 2 * SCALE {
-        m /= 2;
-        k += 1;
+    // For |x-1| < 1e-6, the quadratic remainder is below half a raw
+    // output unit. This preserves raw increments that would be lost while
+    // converting the first midpoint residual to Q42.
+    if x.abs_diff(SCALE) < 1_000_000 {
+        return Ok(x as i128 - SCALE_I);
     }
 
-    let k_i = k as i128;
-    let m_i = m as i128;
+    let (m, k) = normalize_ln(x);
+    Ok(ln_mantissa_lut(m, k))
+}
 
-    // Near x = 1: direct computation to avoid cancellation.
-    let offset = m - SCALE;
-    if offset < LN_TABLE_HALF_STEP {
-        let t_num = m_i - SCALE_I;
-        let t_den = m_i + SCALE_I;
-        // t_num ∈ (-SCALE_I, SCALE_I); t_num * SCALE_I < 1e24 ≪ i128::MAX (1.7e38).
-        let t = (t_num * SCALE_I + t_den / 2) / t_den;
-        let u = fp_mul_i_round(t, t)?;
-        // Horner additions: each fp_mul_i_round result ∈ (-SCALE_I, SCALE_I);
-        // LN_REMEZ_W* < SCALE_I, so each partial sum ∈ (-2·SCALE_I, 2·SCALE_I). Fits i128.
-        let p = fp_mul_i_round(LN_REMEZ_W3, u)? + LN_REMEZ_W2;
-        let p = fp_mul_i_round(p, u)? + LN_REMEZ_W1;
-        let p = fp_mul_i_round(p, u)? + LN_REMEZ_W0;
-        // 2 * t: t ∈ (-SCALE_I, SCALE_I), so 2*t ∈ (-2e12, 2e12). Fits i128.
-        let series_result = fp_mul_i_round(2 * t, p)?;
-        // Direct path: only LN2 correction (no table residual).
-        // |k_i| ≤ 127, LN2_LO ≈ 5.5e10; product < 7e12 ≪ i128::MAX.
-        let ln2_raw = k_i * LN2_LO;
-        let ln2_correction = if ln2_raw >= 0 {
-            (ln2_raw + SCALE_I / 2) / SCALE_I
-        } else {
-            (ln2_raw - SCALE_I / 2) / SCALE_I
-        };
-        // series_result ≤ SCALE_I, k_i * LN2_I ≤ 127 * 6.9e11 ≈ 8.8e13, ln2_correction < 1;
-        // total sum ≪ i128::MAX.
-        return Ok(series_result + k_i * LN2_I + ln2_correction);
+/// Natural logarithm of one plus a signed fixed-point value.
+///
+/// Computes `ln(1 + x / SCALE) * SCALE`. This is the fixed-point counterpart
+/// of `log1p`/`ln_1p` and preserves small increments because `1 + x` is formed
+/// exactly in the integer representation before the compensated near-one
+/// logarithm kernel runs.
+///
+/// - **x**: signed fixed-point at [`SCALE`] (1e12).
+/// - **Returns**: `ln(1 + x)` at `SCALE`.
+/// - **Errors**: [`SolMathError::DomainError`] when `x <= -SCALE`.
+/// - **Accuracy**: max 2 ULP, P99 1 ULP, median 0 over 110,000 retained vectors.
+///
+/// # Example
+/// ```
+/// use solmath::{ln_1p_fixed, SCALE_I};
+///
+/// // ln(1.05) ≈ 0.048790164169
+/// let result = ln_1p_fixed(SCALE_I / 20)?;
+/// assert!((result - 48_790_164_169).abs() <= 2);
+/// # Ok::<(), solmath::SolMathError>(())
+/// ```
+pub fn ln_1p_fixed(x: i128) -> Result<i128, SolMathError> {
+    if x <= -SCALE_I {
+        return Err(SolMathError::DomainError);
+    }
+    if x == SCALE_I {
+        return Ok(LN2_I);
     }
 
-    // Table lookup.
-    let j = (offset / LN_TABLE_STEP) as usize;
-    let j = j.min(15);
+    // For |x| < 1e-6, |ln(1+x) - x| = x²/2 + O(x³), which is strictly
+    // below half a raw SCALE unit. Returning x is therefore correctly rounded
+    // in this interval and, unlike forming the atanh quotient at SCALE,
+    // preserves one-raw-unit increments.
+    if x.unsigned_abs() < 1_000_000 {
+        return Ok(x);
+    }
 
-    let m_j = SCALE + (2 * j as u128 + 1) * LN_TABLE_HALF_STEP;
-    let ln_m_j = LN_TABLE_16[j];
-    let ln_m_j_lo = LN_TABLE_LO_16[j];
-
-    let m_j_i = m_j as i128;
-    let t_num = m_i - m_j_i;
-    let t_den = m_i + m_j_i;
-    // t_num ∈ (-SCALE_I/16, SCALE_I/16) after table reduction; t_num * SCALE_I < 6.25e10 * 1e12 ≪ i128::MAX.
-    let p_val = t_num * SCALE_I;
-    let t = (p_val + t_den / 2) / t_den;
-    // t's sub-ULP residual via multiply-subtract (no second division).
-    // t_rem = p_val - t * t_den: t ≤ SCALE_I/16, t_den ≤ 4*SCALE_I; product ≤ 2.5e23 ≪ i128::MAX.
-    let t_rem = p_val - t * t_den;  // exact remainder
-    // t_rem < t_den ≤ 4*SCALE_I, so t_rem * SCALE_I ≤ 4e24 ≪ i128::MAX.
-    let t_lo = t_rem * SCALE_I / t_den;  // scaled to sub-ULP units
-
-    let u = fp_mul_i_round(t, t)?;
-
-    // Horner additions: same bounds as direct path — each partial sum ∈ (-2·SCALE_I, 2·SCALE_I).
-    let p = fp_mul_i_round(LN_REMEZ_W3, u)? + LN_REMEZ_W2;
-    let p = fp_mul_i_round(p, u)? + LN_REMEZ_W1;
-    let p = fp_mul_i_round(p, u)? + LN_REMEZ_W0;
-
-    // 2 * t: t ∈ (-SCALE_I/16, SCALE_I/16) here; 2*t < 1.25e11. Fits i128.
-    let series_result = fp_mul_i_round(2 * t, p)?;
-
-    // COMBINED sub-ULP correction: table residual + LN2 residual + t residual.
-    // |k_i| ≤ 127, LN2_LO ≈ 5.5e10; k_i * LN2_LO < 7e12. Each of the three terms < 1e12;
-    // combined sum < 3e12 ≪ i128::MAX.
-    let combined_lo = ln_m_j_lo + k_i * LN2_LO + t_lo;
-    let correction = if combined_lo >= 0 {
-        (combined_lo + SCALE_I / 2) / SCALE_I
+    let one_plus_x = if x < 0 {
+        (SCALE_I + x) as u128
     } else {
-        (combined_lo - SCALE_I / 2) / SCALE_I
+        SCALE.checked_add(x as u128).ok_or(SolMathError::Overflow)?
     };
 
-    // series_result ≤ SCALE_I, ln_m_j ≤ LN_TABLE_16 max ≈ 0.7*SCALE_I, k_i * LN2_I ≤ 8.8e13,
-    // correction ≈ 0 to 1; total sum ≪ i128::MAX.
-    Ok(series_result + ln_m_j + k_i * LN2_I + correction)
+    // Normalize once, then use a dedicated 1,024-segment Q42 kernel. Common
+    // rate inputs stay in the first two branches and execute no loop.
+    let (m, k) = normalize_ln(one_plus_x);
+
+    Ok(ln_mantissa_lut(m, k))
 }
 
 /// Exponential: e^(x / SCALE) * SCALE.
 ///
-/// Remez rational approximation with LN2 residual correction.
+/// Division-free degree-5 near-minimax approximation after ln(2)/32 reduction.
 ///
 /// - **x**: signed fixed-point at `SCALE` (1e12).
-/// - **Returns**: `i128` at `SCALE`. Always positive for valid inputs.
+/// - **Returns**: non-negative `i128` at `SCALE`; very negative valid inputs
+///   can round to zero.
 /// - **Errors**: `Overflow` if `x >= 40 * SCALE`. Returns `Ok(0)` for `x <= -40 * SCALE`.
-/// - **Accuracy**: max 1 ULP.
+/// - **Accuracy**: the reduced kernel has a conservative relative bound below
+///   `4.833e-15`. Absolute raw error grows with the reconstructed power of two;
+///   see the retained production/adversarial measurements in `VALIDATION.md`.
 ///
 /// # Example
 /// ```
@@ -136,58 +230,78 @@ pub fn ln_fixed_i(x: u128) -> Result<i128, SolMathError> {
 pub fn exp_fixed_i(x: i128) -> Result<i128, SolMathError> {
     let max_x = 40 * SCALE_I;
 
-    if x <= -max_x { return Ok(0); }
-    if x >= max_x { return Err(SolMathError::Overflow); }
-    if x == 0 { return Ok(SCALE_I); }
-
-    // Range reduction with split LN2 correction.
-    // LN2_I overshoots true ln(2)×SCALE (LN2_LO < 0), so k*LN2_I is too large
-    // and r = x - k*LN2_I is too small. Subtract the negative correction to add back.
-    let mut k = x / LN2_I;
-    let ln2_correction = {
-        // |k| ≤ 57 (x < 40*SCALE_I, LN2_I ≈ 6.9e11), LN2_LO ≈ 5.5e10; product < 3.1e12 ≪ i128::MAX.
-        let raw = k * LN2_LO;
-        if raw >= 0 { (raw + SCALE_I / 2) / SCALE_I } else { (raw - SCALE_I / 2) / SCALE_I }
-    };
-    // x < 40*SCALE_I ≈ 4e13; k * LN2_I ≤ 57 * 6.9e11 ≈ 3.9e13; r ∈ [-LN2/2, LN2/2] ≈ ±3.5e11.
-    let mut r = x - k * LN2_I - ln2_correction;
-
-    let half_ln2 = LN2_I / 2;
-    if r > half_ln2 {
-        k += 1;
-        // r ∈ (LN2/2, LN2_I]; r - LN2_I ∈ (-LN2/2, 0]. Stays in [-LN2/2, LN2/2].
-        r -= LN2_I;
-    } else if r < -half_ln2 {
-        k -= 1;
-        // r ∈ [-LN2_I, -LN2/2); r + LN2_I ∈ (0, LN2/2]. Stays in [-LN2/2, LN2/2].
-        r += LN2_I;
+    if x <= -max_x {
+        return Ok(0);
+    }
+    if x >= max_x {
+        return Err(SolMathError::Overflow);
+    }
+    // For |x| < 1e-6, the exp Taylor remainder is strictly below half a
+    // raw unit. This is correctly rounded and preserves tiny rate inputs.
+    if (-1_000_000..1_000_000).contains(&x) {
+        return Ok(SCALE_I + x);
     }
 
-    // Remez rational formula
-    let xx = fp_mul_i_round(r, r)?;
+    // First reduce to the nearest full ln(2) octave using only i64. A split
+    // reciprocal converts the small raw residual to Q63 without a wide
+    // range-reduction multiply, then restores LN2_I's sub-raw residual.
+    let x64 = x as i64;
+    let octave_estimate = round_shift_i64(x64 * EXPM1_INV_LN2_Q56, 56) as i32;
+    let raw_residual = x64 - octave_estimate as i64 * LN2_I as i64;
+    let scaled_residual = raw_residual * EXP_RAW_TO_Q63_HI
+        + round_shift_i64(raw_residual * EXP_RAW_TO_Q63_FRAC_Q28, 28);
+    let octave_residual_q63 = round_shift_i64(scaled_residual, 1)
+        - round_shift_i64(octave_estimate as i64 * EXP_LN2_RESIDUAL_Q96, 33);
 
-    // Horner: poly = P1 + xx*(P2 + xx*(P3 + xx*(P4 + xx*P5)))
-    // EXP_REMEZ_P* < SCALE_I; each partial sum ∈ (-2·SCALE_I, 2·SCALE_I). Fits i128.
-    let poly = fp_mul_i_round(xx, EXP_REMEZ_P5)? + EXP_REMEZ_P4;
-    let poly = fp_mul_i_round(xx, poly)? + EXP_REMEZ_P3;
-    let poly = fp_mul_i_round(xx, poly)? + EXP_REMEZ_P2;
-    let poly = fp_mul_i_round(xx, poly)? + EXP_REMEZ_P1;
+    // Split the octave into 32 cells. The proposal uses raw i64 arithmetic;
+    // the Q63 check makes the final cell exact at every reduction seam.
+    let mut subcell = round_shift_i64(
+        raw_residual * EXPM1_INV_LN2_Q56,
+        (56 - EXP_PHASE_BITS) as u32,
+    ) as i32;
+    let mut r_q63 = octave_residual_q63 - subcell as i64 * EXP_STEP_Q63;
+    let half_step_q63 = (EXP_STEP_Q63 + 1) / 2;
+    if r_q63 > half_step_q63 {
+        subcell += 1;
+        r_q63 -= EXP_STEP_Q63;
+    } else if r_q63 < -half_step_q63 {
+        subcell -= 1;
+        r_q63 += EXP_STEP_Q63;
+    }
+    debug_assert!(r_q63.abs() <= half_step_q63 + 1);
 
-    // c = r - poly * r^2
-    // r ∈ [-LN2/2, LN2/2] ≈ ±3.5e11; fp_mul_i_round(poly, xx) ≤ SCALE_I; c ∈ [-2·SCALE_I, 2·SCALE_I].
-    let c = r - fp_mul_i_round(poly, xx)?;
+    let poly = mul_q63_i64(EXP_REMEZ_Q22[0], r_q63) + EXP_REMEZ_Q22[1];
+    let poly = mul_q63_i64(poly, r_q63) + EXP_REMEZ_Q22[2];
+    let poly = mul_q63_i64(poly, r_q63) + EXP_REMEZ_Q22[3];
+    let poly = mul_q63_i64(poly, r_q63) + EXP_REMEZ_Q22[4];
+    let poly = mul_q63_i64(poly, r_q63) + EXP_REMEZ_Q22[5];
 
-    // exp(r) = 1 + r + r*c/(2-c)
-    // SCALE_I + r: r ≤ LN2/2 ≈ 3.5e11, SCALE_I = 1e12; sum < 1.35e12.
-    // 2 * SCALE_I - c: c ≤ 2·SCALE_I; denominator ∈ (0, 4·SCALE_I). Cannot underflow (c < 2*SCALE_I for valid r).
-    let rc = fp_mul_i_round(r, c)?;
-    let sum = SCALE_I + r + fp_div_i(rc, 2 * SCALE_I - c)?;
-
-    // Multiply by 2^k
-    if k >= 0 {
-        sum.checked_shl(k as u32).ok_or(SolMathError::Overflow)
+    // cell = 32*octave + phase. These constants reconstruct only the
+    // fractional power of two; they are not a sampled answer table.
+    let cell = octave_estimate * EXP_PHASES as i32 + subcell;
+    let octave = cell >> EXP_PHASE_BITS;
+    let phase = (cell & (EXP_PHASES as i32 - 1)) as usize;
+    let (guarded, guard) = if phase == 0 {
+        (poly as i128, EXP_POLY_GUARD)
     } else {
-        Ok(sum >> (-k) as u32)
+        (
+            poly as i128 * EXP2_PHASE_Q62[phase] as i128,
+            EXP_POLY_GUARD + 62,
+        )
+    };
+
+    // Fold phase and octave reconstruction into one final rounding point.
+    let shift = guard - octave;
+    if shift >= 128 {
+        Ok(0)
+    } else if shift > 0 {
+        Ok(round_shift_signed(guarded, shift as u32))
+    } else if shift == 0 {
+        Ok(guarded)
+    } else {
+        guarded
+            .checked_shl((-shift) as u32)
+            .ok_or(SolMathError::Overflow)
     }
 }
 
@@ -245,16 +359,62 @@ pub fn pow_fixed(base: u128, exponent: u128) -> Result<u128, SolMathError> {
         }
     }
 
+    // The standard log now preserves raw near-one deltas, but its sub-ULP
+    // log error can still be amplified by a large real exponent. Keep that
+    // narrow composition on the HP path; ordinary exponents and the special
+    // square/square-root branches above retain the cheaper implementation.
+    if base.abs_diff(SCALE) < 1_000_000 && exponent > SCALE {
+        return pow_fixed_hp(base, exponent);
+    }
+
     // General case: exp(exponent * ln(base))
     let ln_base = ln_fixed_i(base)?; // i128
-    let exp_i = exponent as i128;
-    let product = fp_mul_i(exp_i, ln_base)?; // exponent * ln(base)
+    if ln_base == 0 && base != SCALE {
+        // Standard-scale ln cannot resolve bases one or a few raw units from
+        // one. A huge exponent would otherwise turn that lost bit into a
+        // catastrophic result of exactly one.
+        return pow_fixed_hp(base, exponent);
+    }
+    let exp_i = match i128::try_from(exponent) {
+        Ok(v) => v,
+        Err(_) if base < SCALE => return Ok(0),
+        Err(_) => return Err(SolMathError::Overflow),
+    };
+    let product = match fp_mul_i(exp_i, ln_base) {
+        Ok(v) => v,
+        Err(SolMathError::Overflow) if base < SCALE => return Ok(0),
+        Err(e) => return Err(e),
+    }; // exponent * ln(base)
     let result = exp_fixed_i(product)?;
-    Ok(if result <= 0 {
-        0
-    } else {
-        result as u128
-    })
+    Ok(if result <= 0 { 0 } else { result as u128 })
+}
+
+#[cfg(test)]
+mod adversarial_power_tests {
+    use super::*;
+
+    #[test]
+    fn huge_positive_exponents_preserve_direction() {
+        assert_eq!(pow_fixed(SCALE / 2, 1u128 << 127), Ok(0));
+        assert_eq!(
+            pow_fixed(2 * SCALE, 1u128 << 127),
+            Err(SolMathError::Overflow)
+        );
+        assert_eq!(pow_fixed(SCALE / 10, i128::MAX as u128), Ok(0));
+    }
+
+    #[test]
+    fn near_one_large_exponent_uses_high_precision_log() {
+        let exponent = 1u128 << 80;
+        assert_eq!(
+            pow_fixed(SCALE + 1, exponent),
+            pow_fixed_hp(SCALE + 1, exponent)
+        );
+        assert_eq!(
+            pow_fixed(SCALE + 1, 1u128 << 86),
+            Err(SolMathError::Overflow)
+        );
+    }
 }
 
 /// Integer power: base^n via repeated squaring or HP path.
@@ -269,26 +429,43 @@ pub fn pow_int(base: u128, n: u128) -> Result<u128, SolMathError> {
     match n {
         0 => Ok(SCALE),
         1 => Ok(base),
+        _ if base == 0 => Ok(0),
+        _ if base == SCALE => Ok(SCALE),
         2 => fp_mul(base, base),
         3 => Ok(fp_mul(fp_mul(base, base)?, base)?),
-        4 => { let x2 = fp_mul(base, base)?; fp_mul(x2, x2) },
+        4 => {
+            let x2 = fp_mul(base, base)?;
+            fp_mul(x2, x2)
+        }
         _ => {
             // Check if n * ln(base) fits in HP exp's working range
             let ln_base = ln_fixed_i(base)?;
-            let total = match (n as i128).checked_mul(ln_base) {
-                Some(v) => v,
-                None => if ln_base > 0 { return Err(SolMathError::Overflow) } else { return Ok(0) },
+            let n_i = match i128::try_from(n) {
+                Ok(value) => value,
+                Err(_) if base < SCALE => return Ok(0),
+                Err(_) => return Err(SolMathError::Overflow),
             };
-            if total.abs() < 39 * SCALE_I {
-                pow_fixed_hp(base, n * SCALE)
+            let total = match n_i.checked_mul(ln_base) {
+                Some(v) => v,
+                None => {
+                    if ln_base > 0 {
+                        return Err(SolMathError::Overflow);
+                    } else {
+                        return Ok(0);
+                    }
+                }
+            };
+            if total.unsigned_abs() < (39 * SCALE_I) as u128 {
+                let exponent = n.checked_mul(SCALE).ok_or(SolMathError::Overflow)?;
+                pow_fixed_hp(base, exponent)
             } else {
                 // Split: base^n = (base^(n/2))² × base^(n%2)
                 let half = pow_int(base, n / 2)?;
-                let mut result = checked_mul_div_u(half, half, SCALE)
-                    .ok_or(SolMathError::Overflow)?;
+                let mut result =
+                    checked_mul_div_u(half, half, SCALE).ok_or(SolMathError::Overflow)?;
                 if n % 2 == 1 {
-                    result = checked_mul_div_u(result, base, SCALE)
-                        .ok_or(SolMathError::Overflow)?;
+                    result =
+                        checked_mul_div_u(result, base, SCALE).ok_or(SolMathError::Overflow)?;
                 }
                 Ok(result)
             }
@@ -326,7 +503,8 @@ pub fn pow_fixed_i(base: i128, exponent: i128) -> Result<i128, SolMathError> {
 
     // Negative exponent: 1 / pow(base, |exponent|)
     if exponent < 0 {
-        let pos_result = pow_fixed_i(base, -exponent)?;
+        let positive_exponent = exponent.checked_neg().ok_or(SolMathError::Overflow)?;
+        let pos_result = pow_fixed_i(base, positive_exponent)?;
         if pos_result == 0 {
             return Err(SolMathError::Overflow); // 1/0 → overflow
         }
@@ -361,44 +539,172 @@ pub fn pow_fixed_i(base: i128, exponent: i128) -> Result<i128, SolMathError> {
 
 /// exp(x) - 1 with better precision near zero: (e^(x/SCALE) - 1) * SCALE.
 ///
-/// Uses degree-11 Taylor on [-0.5, 0.5] to avoid catastrophic cancellation,
-/// falls back to `exp_fixed_i(x) - SCALE` outside that range.
+/// Uses a 1,292-segment midpoint table and Q43 cubic residual with one wide
+/// multiply. A correctly-rounded direct path preserves raw increments near zero.
 ///
 /// - **x**: signed fixed-point at `SCALE` (1e12).
 /// - **Returns**: `i128` at `SCALE`. Near zero for small x.
-/// - **Errors**: `Overflow` if `exp_fixed_i` overflows (|x| > 0.5 and x >= 40*SCALE).
-/// - **Accuracy**: max 3 ULP.
+/// - **Errors**: `Overflow` when `x >= 40*SCALE`; saturates to `-SCALE` when
+///   `x <= -40*SCALE`.
+/// - **Accuracy**: for `|x| <= 2`, max 3 ULP, P99 2 ULP, median 0 over
+///   60,000 retained production vectors. Measured full-domain relative error
+///   is below one part per trillion for outputs with magnitude at least one.
 pub fn expm1_fixed(x: i128) -> Result<i128, SolMathError> {
-    let half = SCALE_I / 2;
-    if x > half || x < -half {
-        // exp_fixed_i(x) ∈ (0, e^40 * SCALE_I); subtracting SCALE_I is safe — no overflow.
-        return Ok(exp_fixed_i(x)? - SCALE_I);
+    let limit = 40 * SCALE_I;
+    if x <= -limit {
+        return Ok(-SCALE_I);
     }
-    if x == 0 { return Ok(0); }
+    if x >= limit {
+        return Err(SolMathError::Overflow);
+    }
 
-    const C11: i128 = 25_052;
-    const C10: i128 = 275_573;
-    const C9: i128 = 2_755_732;
-    const C8: i128 = 24_801_587;
-    const C7: i128 = 198_412_698;
-    const C6: i128 = 1_388_888_889;
-    const C5: i128 = 8_333_333_333;
-    const C4: i128 = 41_666_666_667;
-    const C3: i128 = 166_666_666_667;
-    const C2: i128 = 500_000_000_000;
-    const C1: i128 = SCALE_I;
+    // On |x| < 1e-6, expm1(x)-x = x²/2+O(x³) is below half a raw unit.
+    if x.unsigned_abs() < 1_000_000 {
+        return Ok(x);
+    }
 
-    // x ∈ [-0.5·SCALE_I, 0.5·SCALE_I]. Horner accumulation: fp_mul_i_round result ≤ SCALE_I/2;
-    // each Cn ≤ SCALE_I, so every partial sum ∈ (-2·SCALE_I, 2·SCALE_I). Fits i128.
-    let p = fp_mul_i_round(x, C11)? + C10;
-    let p = fp_mul_i_round(x, p)? + C9;
-    let p = fp_mul_i_round(x, p)? + C8;
-    let p = fp_mul_i_round(x, p)? + C7;
-    let p = fp_mul_i_round(x, p)? + C6;
-    let p = fp_mul_i_round(x, p)? + C5;
-    let p = fp_mul_i_round(x, p)? + C4;
-    let p = fp_mul_i_round(x, p)? + C3;
-    let p = fp_mul_i_round(x, p)? + C2;
-    let p = fp_mul_i_round(x, p)? + C1;
-    Ok(fp_mul_i_round(x, p)?)
+    let x64 = x as i64; // |x| < 40*SCALE_I < i64::MAX.
+    let mut k = round_shift_i64(x64 * EXPM1_INV_LN2_Q56, 56) as i32;
+    debug_assert!((K_LN2_MIN..=64).contains(&k));
+    let mut r = x64 - K_LN2_RAW[(k - K_LN2_MIN) as usize];
+    const HALF_LN2_RAW: i64 = 346_573_590_280;
+    if r > HALF_LN2_RAW {
+        k += 1;
+        r = x64 - K_LN2_RAW[(k - K_LN2_MIN) as usize];
+    } else if r < -HALF_LN2_RAW {
+        k -= 1;
+        r = x64 - K_LN2_RAW[(k - K_LN2_MIN) as usize];
+    }
+
+    let offset = (r - EXPM1_R_MIN) as u64;
+    debug_assert!(r >= EXPM1_R_MIN);
+    let j = ((offset >> EXPM1_LUT_STEP_SHIFT) as usize).min(EXPM1_LUT_SEGMENTS - 1);
+    let midpoint = EXPM1_R_MIN + j as i64 * EXPM1_LUT_STEP + EXPM1_LUT_STEP / 2;
+    let delta = r - midpoint;
+
+    // exp(delta) at Q43. |delta| <= 2^28 raw, so all products fit i64;
+    // the omitted quartic contributes less than 0.001 raw unit before scaling.
+    let q = round_shift_i64(delta * EXPM1_RAW_TO_Q43_G31, 31);
+    let q2 = mul_q43(q, q);
+    let q3 = mul_q43(q2, q);
+    let local_q43 = (1i64 << 43) + q + q2 / 2 + q3 / 6;
+
+    // The midpoint already contains decimal SCALE with 22 binary guard bits,
+    // so one wide product produces the final-scale value without a second
+    // wide multiplication by SCALE.
+    let exp_r_raw_q22 =
+        round_shift_signed(EXPM1_MID_EXP_RAW_Q22[j] as i128 * local_q43 as i128, 43);
+    let shift = 22 - k;
+    let exp_x = if shift > 0 {
+        round_shift_signed(exp_r_raw_q22, shift as u32)
+    } else if shift == 0 {
+        exp_r_raw_q22
+    } else {
+        exp_r_raw_q22
+            .checked_shl((-shift) as u32)
+            .ok_or(SolMathError::Overflow)?
+    };
+    Ok(exp_x - SCALE_I)
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    #[test]
+    fn pow_fixed_rejects_unsigned_exponent_that_cannot_be_signed() {
+        assert_eq!(
+            pow_fixed(2 * SCALE, i128::MAX as u128 + 1),
+            Err(SolMathError::Overflow)
+        );
+    }
+
+    #[test]
+    fn pow_int_handles_zero_and_extreme_exponents_consistently() {
+        assert_eq!(pow_int(0, 5), Ok(0));
+        assert_eq!(pow_int(SCALE, u128::MAX), Ok(SCALE));
+        assert_eq!(pow_int(SCALE / 2, i128::MAX as u128 + 1), Ok(0));
+        assert_eq!(
+            pow_int(2 * SCALE, i128::MAX as u128 + 1),
+            Err(SolMathError::Overflow)
+        );
+    }
+
+    #[test]
+    fn pow_fixed_i_rejects_unnegatable_min_exponent() {
+        assert_eq!(
+            pow_fixed_i(2 * SCALE_I, i128::MIN),
+            Err(SolMathError::Overflow)
+        );
+    }
+
+    #[test]
+    fn ln_1p_has_explicit_domain_and_exact_special_values() {
+        assert_eq!(ln_1p_fixed(-SCALE_I), Err(SolMathError::DomainError));
+        assert_eq!(ln_1p_fixed(i128::MIN), Err(SolMathError::DomainError));
+        assert_eq!(ln_1p_fixed(0), Ok(0));
+        assert_eq!(ln_1p_fixed(SCALE_I), ln_fixed_i(2 * SCALE));
+        assert!(ln_1p_fixed(i128::MAX).is_ok());
+    }
+
+    #[test]
+    fn ln_1p_preserves_raw_increments_near_zero() {
+        assert_eq!(ln_1p_fixed(1), Ok(1));
+        assert_eq!(ln_1p_fixed(-1), Ok(-1));
+        assert_eq!(ln_1p_fixed(2), Ok(2));
+        assert_eq!(ln_1p_fixed(-2), Ok(-2));
+    }
+
+    #[test]
+    fn ln_1p_and_expm1_round_trip_financial_rates() {
+        for x in [
+            -900_000_000_000,
+            -500_000_000_000,
+            -10_000_000_000,
+            -1_000_000,
+            1_000_000,
+            10_000_000_000,
+            500_000_000_000,
+            5 * SCALE_I,
+        ] {
+            let recovered = expm1_fixed(ln_1p_fixed(x).unwrap()).unwrap();
+            assert!((recovered - x).abs() <= 12, "x={x}, recovered={recovered}");
+        }
+    }
+
+    #[test]
+    fn expm1_has_explicit_limits_and_preserves_raw_increments() {
+        let limit = 40 * SCALE_I;
+        assert_eq!(expm1_fixed(i128::MIN), Ok(-SCALE_I));
+        assert_eq!(expm1_fixed(-limit), Ok(-SCALE_I));
+        assert_eq!(expm1_fixed(limit), Err(SolMathError::Overflow));
+        assert_eq!(expm1_fixed(i128::MAX), Err(SolMathError::Overflow));
+        assert_eq!(expm1_fixed(-1), Ok(-1));
+        assert_eq!(expm1_fixed(0), Ok(0));
+        assert_eq!(expm1_fixed(1), Ok(1));
+    }
+
+    #[test]
+    fn expm1_matches_known_ordinary_values() {
+        assert!(expm1_fixed(SCALE_I).unwrap().abs_diff(1_718_281_828_459) <= 3);
+        assert!(expm1_fixed(-SCALE_I).unwrap().abs_diff(-632_120_558_829) <= 1);
+    }
+
+    #[test]
+    fn expm1_is_monotone_across_every_lut_boundary_and_exponent() {
+        for k in -58..=58 {
+            let k_ln2 = K_LN2_RAW[(k - K_LN2_MIN) as usize] as i128;
+            for j in 1..EXPM1_LUT_SEGMENTS {
+                let boundary = EXPM1_R_MIN as i128 + j as i128 * EXPM1_LUT_STEP as i128;
+                let x_left = k_ln2 + boundary - 1;
+                let x_right = k_ln2 + boundary;
+                if x_left <= -40 * SCALE_I || x_right >= 40 * SCALE_I {
+                    continue;
+                }
+                let left = expm1_fixed(x_left).unwrap();
+                let right = expm1_fixed(x_right).unwrap();
+                assert!(left <= right, "k={k}, j={j}: {left} > {right}");
+            }
+        }
+    }
 }

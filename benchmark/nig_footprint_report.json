@@ -1,0 +1,20 @@
+{
+  "run_date": "2026-07-14",
+  "toolchain": "Solana CLI / Agave 2.3.0 cargo-build-sbf, fat LTO, one codegen unit, overflow checks enabled",
+  "baseline": {
+    "bytes": 184848,
+    "sha256": "04bd66556683a8b98e760b61655fb27cdef7fe182bcc3aafde892c56cd133c33"
+  },
+  "nig": {
+    "bytes": 311464,
+    "sha256": "8ffd259c6b28570f26ed5ea7aec90891582c78f8b06c7ae14242e5d9ad2fbed0"
+  },
+  "linked_delta_bytes": 126616,
+  "linked_delta_kib": 123.6484375,
+  "full_composite": {
+    "bytes": 1083408,
+    "sha256": "685d49886179ca0bec80e31d9e9b878f3d044a47869cfd2f70cc2cf194c05161",
+    "historical_fail_closed_bytes": 1012056,
+    "delta_vs_historical_fail_closed_bytes": 71352
+  }
+}
