@@ -33,7 +33,7 @@ jobs:
         with:
           toolchain: 1.93.0
           targets: thumbv7em-none-eabihf
-          components: rustfmt
+          components: rustfmt, clippy
       - run: git diff --check
       - run: cargo fmt --check
       - name: Clippy correctness and suspicious-code gates
