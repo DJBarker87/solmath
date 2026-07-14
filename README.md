@@ -8,7 +8,8 @@ Solana.
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
 SolMath is a `no_std`, zero-dependency library for deterministic decimal math,
-probability functions, derivatives pricing, and DeFi calculations. Runtime
+probability functions, derivatives pricing, and DeFi calculations. Heavily CU optimised to fit on Solana and all functions thoroughly verified against at least 100k
+quantlib vectors for accuracy. Runtime
 code uses integer arithmetic with 12 decimal places; there is no floating point,
 heap allocation, network access, or off-chain pricing service.
 
